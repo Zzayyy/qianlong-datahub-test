@@ -80,7 +80,7 @@ class SshWorker(QThread):
     finished = Signal(int)
 
     def __init__(self, host, port, username, password, remote_dir, command,
-                 files_to_upload=None, parent=None):
+                 files_to_upload=None, download_config=None, parent=None):
         super().__init__(parent)
         self.host = host
         self.port = port
@@ -89,6 +89,8 @@ class SshWorker(QThread):
         self.remote_dir = remote_dir
         self.command = command
         self.files_to_upload = files_to_upload or []
+        # download_config: {"remote": 远程目录, "local": 本地目录, "patterns": [glob...]}
+        self.download_config = download_config
         self._client = None
         self._chan = None
 
@@ -184,6 +186,12 @@ class SshWorker(QThread):
                                 if ln.strip():
                                     self.line.emit(ln.rstrip("\r"))
                     rc = self._chan.recv_exit_status()
+                    # 下载远程结果文件（性能统计 Excel/log）
+                    if self.download_config:
+                        try:
+                            self._download_results(rc)
+                        except Exception as e:
+                            self.line.emit(f"[SSH] 下载结果失败: {e}")
                     self.finished.emit(rc)
                     return
                 self.msleep(50)
@@ -196,6 +204,41 @@ class SshWorker(QThread):
                     self._client.close()
                 except Exception:
                     pass
+
+    def _download_results(self, rc):
+        """执行完后，从远程下载匹配的文件（性能统计 Excel/log）"""
+        cfg = self.download_config
+        remote_dir = cfg["remote"]
+        local_dir = cfg["local"]
+        patterns = cfg.get("patterns", ["*.xlsx", "*.log"])
+        os.makedirs(local_dir, exist_ok=True)
+        sftp = self._client.open_sftp()
+        try:
+            try:
+                files = sftp.listdir_attr(remote_dir)
+            except IOError:
+                self.line.emit(f"[SSH] 远程目录 {remote_dir} 不存在，无结果可下载")
+                return
+            import fnmatch
+            remote_files = sorted(files, key=lambda a: a.st_mtime, reverse=True)
+            downloaded = 0
+            for attr in remote_files:
+                name = attr.filename
+                if any(fnmatch.fnmatch(name, p) for p in patterns):
+                    remote_path = f"{remote_dir}/{name}"
+                    local_path = os.path.join(local_dir, name)
+                    try:
+                        sftp.get(remote_path, local_path)
+                        self.line.emit(f"[SSH] 已下载结果: {local_path}")
+                        downloaded += 1
+                    except Exception as e:
+                        self.line.emit(f"[SSH] 下载 {name} 失败: {e}")
+            if downloaded == 0:
+                self.line.emit(f"[SSH] 远程 {remote_dir} 无匹配文件（未生成统计结果）")
+            else:
+                self.line.emit(f"[SSH] 结果保存在: {local_dir}")
+        finally:
+            sftp.close()
 
     def _drain(self, name, bufs, data):
         """按行消费缓冲，超过一定量先强制刷出，避免越积越多"""
@@ -232,6 +275,8 @@ DEFAULT_CONFIG = {
     "mock": "1",
     "verify": "1",
     "destroy_via_plugin": "0",
+    "download": "1",
+    "download_dir": "out/performance",
 }
 
 
@@ -370,6 +415,20 @@ class MainWindow(QWidget):
         g3.addWidget(self.edit_remote_dir, 3, 1, 1, 3)
         root.addWidget(grp3)
 
+        # ---- 结果保存 ----
+        grp4 = QGroupBox("4. 结果保存 (性能统计 Excel/log)")
+        g4 = QGridLayout(grp4)
+        self.chk_download = QCheckBox("自动下载结果到本地电脑")
+        self.chk_download.setChecked(self.cfg.get("download", "1") == "1")
+        g4.addWidget(self.chk_download, 0, 0, 1, 4)
+        g4.addWidget(QLabel("本地目录:"), 1, 0)
+        _dl_dir = self.cfg.get("download_dir", "out/performance")
+        if not os.path.isabs(_dl_dir):
+            _dl_dir = os.path.join(BASE_DIR, _dl_dir)
+        self.edit_download_dir = QLineEdit(_dl_dir)
+        g4.addWidget(self.edit_download_dir, 1, 1, 1, 3)
+        root.addWidget(grp4)
+
         # ---- 操作按钮 ----
         btns = QHBoxLayout()
         self.btn_send = QPushButton("运行发送测试")
@@ -416,7 +475,8 @@ class MainWindow(QWidget):
         self.worker.finished.connect(lambda rc: self.on_done(rc, on_done))
         self.worker.start()
 
-    def run_remote(self, command, files_to_upload=None, on_done=None):
+    def run_remote(self, command, files_to_upload=None, on_done=None,
+                   download_config=None):
         """SSH 远程执行"""
         host = self.edit_host.text().strip()
         user = self.edit_user.text().strip()
@@ -429,7 +489,7 @@ class MainWindow(QWidget):
         self.set_running(True)
         self.append_log(f"[SSH] 连接 {user}@{host}:{port} 目录 {remote_dir}")
         self.worker = SshWorker(host, port, user, pwd, remote_dir, command,
-                                files_to_upload, self)
+                                files_to_upload, download_config, self)
         self.worker.line.connect(self.append_log)
         self.worker.finished.connect(lambda rc: self.on_done(rc, on_done))
         self.worker.start()
@@ -508,6 +568,8 @@ class MainWindow(QWidget):
             "mock": "1" if self.chk_mock.isChecked() else "0",
             "verify": "1" if self.chk_verify.isChecked() else "0",
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
+            "download": "1" if self.chk_download.isChecked() else "0",
+            "download_dir": self.edit_download_dir.text().strip() or DEFAULT_CONFIG["download_dir"],
         }
         save_config(cfg)
 
@@ -546,7 +608,17 @@ class MainWindow(QWidget):
         name = self.cmb_interface.currentText()
         cmd_str = self.build_send_cmd(name)
         if self.chk_remote.isChecked():
-            self.run_remote(cmd_str, files_to_upload=self.remote_upload_files(name))
+            # 勾选"自动下载结果"时，执行完拉回性能统计 Excel/log
+            dl = None
+            if self.chk_download.isChecked():
+                dl = {
+                    "remote": self.edit_remote_dir.text().strip() + "/out/performance",
+                    "local": self.edit_download_dir.text().strip() or
+                             os.path.join(BASE_DIR, "out", "performance"),
+                    "patterns": [f"{name}_*.xlsx", f"{name}_*.log"],
+                }
+            self.run_remote(cmd_str, files_to_upload=self.remote_upload_files(name),
+                            download_config=dl)
         else:
             # 本地：用 venv python 跑，但 .so 在 Linux 时才有真实发送
             cmd = [PYTHON, os.path.join(BASE_DIR, "send_test.py"),

@@ -37,6 +37,7 @@ sys.path.insert(0, BASE_DIR)
 sys.path.insert(0, INTERFACES_DIR)
 
 from mock_datahub import MockDataHub, RespClient
+from perf_stats import PerfStats
 
 try:
     from openpyxl import load_workbook
@@ -48,6 +49,9 @@ REDIS_HOST = os.environ.get("REDISHOST", "192.168.1.137")
 REDIS_PASSWORD = os.environ.get("REDISPWD", "QianLong@2026&")
 REDIS_PORT = int(os.environ.get("REDISPORT", "6379"))
 REDIS_SELECT = int(os.environ.get("REDISSELECT", "0"))
+
+# 请求流名（插件/破坏测试都写入这里，数据中台从此消费）
+REQ_STREAM = "DataHub_req_stream"
 
 
 def load_redis_cfg(cfg_path):
@@ -126,8 +130,6 @@ def load_cases(excel, max_cases):
         rec["_no"] = rec.get("case_no") or f"C{len(cases) + 1}"
         rec["_type"] = (rec.get("case_type") or "normal").strip().lower()
         cases.append(rec)
-    if max_cases > 0:
-        cases = cases[:max_cases]
     return cases
 
 
@@ -231,7 +233,7 @@ def destroy_write_redis(payload, req_id, destroy_mode="type1", server_id="12345"
         for k, v in fields.items():
             flat.append(k)
             flat.append(v)
-        conn.cmd("XADD", "DataHub_req_stream", "*", *flat)
+        conn.cmd("XADD", REQ_STREAM, "*", *flat)
         conn.close()
         print(f"  [DESTROY/{destroy_mode}] 已直写 DataHub_req_stream: {req_id}")
         return True
@@ -262,18 +264,37 @@ def main():
                     help="破坏测试类型(type1/type2)，空=按 Excel 行级 destroy_mode 列，默认 type1")
     ap.add_argument("--destroy-server-id", default="12345",
                     help="type1 用的 server_id（默认 12345，与 mock 应答一致）")
+    ap.add_argument("--no-stats", dest="stats", action="store_false", default=True,
+                    help="关闭性能统计(默认开)")
+    ap.add_argument("--stats-out", default="",
+                    help="统计输出目录（默认 out/performance/）")
+    ap.add_argument("--stats-interval", type=float, default=1.0,
+                    help="统计采样间隔秒数")
     ap.add_argument("--no-send", action="store_true", help="只生成报文不发送")
     args = ap.parse_args()
 
     mod = load_interface(args.interface)
     excel = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
-    cases = load_cases(excel, args.max)
+    cases = load_cases(excel, 0)   # 先读全部
     # --type 过滤：只发指定用例类型（normal/error/destroy，可逗号分隔）
     if args.type:
         allowed = {t.strip().lower() for t in args.type.split(",") if t.strip()}
         cases = [c for c in cases if c["_type"] in allowed]
         if not cases:
             sys.exit(f"[FAIL] 类型 {args.type} 过滤后无用例。可用类型: normal/error/destroy")
+    # --max 循环：过滤后再循环到 N 条（压测需要）
+    if args.max > len(cases):
+        base = cases[:]
+        n0 = len(cases)
+        while len(cases) < args.max:
+            for c in base:
+                if len(cases) >= args.max:
+                    break
+                c2 = dict(c)
+                c2["_no"] = f"{c2['_no']}_{len(cases) - n0 + 1}"
+                cases.append(c2)
+    elif 0 < args.max <= len(cases):
+        cases = cases[:args.max]
     print(f"[INFO] 接口={mod.NAME} 从 {excel} 读取 {len(cases)} 条用例")
     from collections import Counter
     print(f"[INFO] 类型分布: {dict(Counter(c['_type'] for c in cases))}\n")
@@ -305,6 +326,15 @@ def main():
 
     client = DataHubClient(so, unique=mod.NAME, reply_flag=args.reply)
 
+    # 性能统计
+    stats = None
+    if args.stats:
+        stats = PerfStats(redis_cfg={
+            "host": REDIS_HOST, "port": REDIS_PORT, "password": REDIS_PASSWORD,
+            "db": REDIS_SELECT, "stream": REQ_STREAM,
+        })
+        stats.start(interval=args.stats_interval)
+
     mock = None
     if args.mock:
         beat_channels = ["tradeserver_online"]
@@ -327,11 +357,23 @@ def main():
             else:
                 plugin_cases.append((c, p))
 
+        # 标记发送阶段开始（真实吞吐统计用）
+        if stats:
+            stats.mark_send_start()
+
         # 1) 插件发送（normal + error）
         if plugin_cases:
+            def do_send(p, req_id):
+                t0 = time.perf_counter()
+                ret = client.send(p, req_id)
+                us = (time.perf_counter() - t0) * 1e6
+                if stats:
+                    stats.record_send(ret >= 0, len(p.encode("utf-8")), us)
+                return ret
+
             t0 = time.time()
             with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                futs = [ex.submit(client.send, p, f"{c['_no']}_{i}")
+                futs = [ex.submit(do_send, p, f"{c['_no']}_{i}")
                         for i, (c, p) in enumerate(plugin_cases)]
                 ok = sum(1 for f in futs if f.result() >= 0)
             dt = time.time() - t0
@@ -347,9 +389,21 @@ def main():
             cnt2 = len(destroy_cases) - cnt1
             print(f"\n[DESTROY] 破坏测试共 {len(destroy_cases)} 条（type1 字段对/task乱写: {cnt2}，"
                   f"type2 字段乱填: {cnt1}），直写 Redis...")
-            ok = sum(1 for c, p in destroy_cases
-                     if destroy_write_redis(p, c["_no"], mode_func(c), args.destroy_server_id))
-            print(f"[DESTROY] 直写成功 {ok}/{len(destroy_cases)}")
+            t0 = time.time()
+            ok = 0
+            for c, p in destroy_cases:
+                ts = time.perf_counter()
+                ret = destroy_write_redis(p, c["_no"], mode_func(c), args.destroy_server_id)
+                us = (time.perf_counter() - ts) * 1e6
+                if stats:
+                    stats.record_send(ret, len(p.encode("utf-8")), us)
+                if ret:
+                    ok += 1
+            print(f"[DESTROY] 直写成功 {ok}/{len(destroy_cases)}，耗时 {time.time() - t0:.3f}s")
+
+        # 标记发送阶段结束
+        if stats:
+            stats.mark_send_end()
 
         print(f"[INFO] 等待 {args.wait}s 收集回复...")
         time.sleep(args.wait)
@@ -359,9 +413,33 @@ def main():
 
         if args.verify:
             verify_redis()
+
     finally:
         if mock:
             mock.stop()
+        # 输出性能统计（Excel + log）——放 finally 里，确保一定执行
+        if stats:
+            try:
+                stats.stop()
+                out_dir = args.stats_out or os.path.join(BASE_DIR, "out", "performance")
+                os.makedirs(out_dir, exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                log_path = os.path.join(out_dir, f"{mod.NAME}_{ts}.log")
+                xlsx_path = os.path.join(out_dir, f"{mod.NAME}_{ts}.xlsx")
+                stats.save_log(log_path)
+                try:
+                    stats.save_excel(xlsx_path)
+                except Exception as e:
+                    print(f"[WARN] Excel 导出失败: {e}")
+                    xlsx_path = None
+                print(f"\n[STATS] 性能统计已保存: {log_path}" + (f" / {xlsx_path}" if xlsx_path else ""))
+                print("[STATS] 汇总:")
+                for k, v in stats.summary().items():
+                    print(f"  {k}: {v}")
+            except Exception as e:
+                print(f"[WARN] 统计输出失败: {e}")
+                import traceback
+                traceback.print_exc()
         print("[INFO] 插件有后台线程，直接强制退出（跳过 DestroyMQ）")
         os._exit(0)
 
