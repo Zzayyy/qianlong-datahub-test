@@ -196,23 +196,36 @@ class DataHubClient:
 
 
 # ==================== 破坏测试：直接写 Redis ====================
-# 按 请求接口doc.txt 的真实 XADD 格式，写入 DataHub_req_stream，
-# 这样数据中台才能取到破坏数据（此前用自定义 DataHub_destroy_stream 中台拿不到）。
-def destroy_write_redis(payload, req_id):
+# 按实测 DataHub_req_stream 的 6 字段格式写入，字段值与插件真实行为一致：
+#   request_id / server_id / server_type / reply_req_stream / reply_reply_stream / task
+# 破坏测试分两类：
+#   type1 - 核心字段正确，task 乱写（测数据中台对畸形业务数据的处理）
+#   type2 - 核心字段乱填（测数据中台对异常来源消息的处理）
+def destroy_write_redis(payload, req_id, destroy_mode="type1", server_id="12345"):
     """绕过插件，直接向 DataHub_req_stream 写入破坏数据。返回 True=成功。"""
     try:
         conn = RespClient(REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, db=REDIS_SELECT)
         conn.connect()
-        # 对齐请求接口doc.txt 格式：
-        # XADD DataHub_req_stream * request_id 'WT-xxx' server_id '0' server_type 'WT'
-        #     reply_req_stream 'WT-0' task '<data>'
-        fields = {
-            "request_id": req_id,
-            "server_id": "0",
-            "server_type": "WT",
-            "reply_req_stream": f"WT-{req_id}",
-            "task": payload,   # 畸形 JSON / 超长 / 特殊字符
-        }
+        if destroy_mode == "type2":
+            # 类2：核心字段乱填
+            fields = {
+                "request_id": "$$$" + str(req_id) + "###",
+                "server_id": "999999999999",
+                "server_type": "XXX",
+                "reply_req_stream": "no_such_stream",
+                "reply_reply_stream": "garbage_reply",
+                "task": payload,
+            }
+        else:
+            # 类1：核心字段正确（对齐插件真实值），task 乱写
+            fields = {
+                "request_id": str(req_id),
+                "server_id": server_id,
+                "server_type": "WT",
+                "reply_req_stream": f"WT-{server_id}",
+                "reply_reply_stream": f"WT-{server_id}-reply",
+                "task": payload,   # 畸形 JSON / 超长 / 特殊字符
+            }
         # 打平成 field1 value1 field2 value2 ...
         flat = []
         for k, v in fields.items():
@@ -220,7 +233,7 @@ def destroy_write_redis(payload, req_id):
             flat.append(v)
         conn.cmd("XADD", "DataHub_req_stream", "*", *flat)
         conn.close()
-        print(f"  [DESTROY] 已直写 DataHub_req_stream: {req_id}")
+        print(f"  [DESTROY/{destroy_mode}] 已直写 DataHub_req_stream: {req_id}")
         return True
     except Exception as e:
         print(f"  [DESTROY] 失败 {req_id}: {e}")
@@ -235,20 +248,32 @@ def main():
     ap.add_argument("--so", default="", help=".so 路径，缺省自动查找")
     ap.add_argument("--workers", type=int, default=4, help="并发线程数")
     ap.add_argument("--max", type=int, default=0, help="最多处理多少条(0=全部)")
+    ap.add_argument("--type", default="",
+                    help="只发指定用例类型，逗号分隔，如 normal,error,destroy（空=全部）")
     ap.add_argument("--wait", type=float, default=3.0, help="发完后等待回复秒数")
     ap.add_argument("--reply", type=int, default=0, choices=[0, 1], help="reply_flag")
-    ap.add_argument("--init-wait", type=float, default=15.0, help="等待插件 inited 最大秒数")
+    ap.add_argument("--init-wait", type=float, default=5.0, help="等待插件 inited 最大秒数(兜底超时，正常2-3s即探测到)")
     ap.add_argument("--mock", action="store_true", default=True, help="启动模拟应答器")
     ap.add_argument("--no-mock", dest="mock", action="store_false", help="关闭模拟应答器")
     ap.add_argument("--verify", action="store_true", help="发送后验证 Redis")
     ap.add_argument("--destroy-via-plugin", action="store_true",
                     help="破坏数据也走插件 SendMQ（默认直接写 Redis）")
+    ap.add_argument("--destroy-mode", default="",
+                    help="破坏测试类型(type1/type2)，空=按 Excel 行级 destroy_mode 列，默认 type1")
+    ap.add_argument("--destroy-server-id", default="12345",
+                    help="type1 用的 server_id（默认 12345，与 mock 应答一致）")
     ap.add_argument("--no-send", action="store_true", help="只生成报文不发送")
     args = ap.parse_args()
 
     mod = load_interface(args.interface)
     excel = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
     cases = load_cases(excel, args.max)
+    # --type 过滤：只发指定用例类型（normal/error/destroy，可逗号分隔）
+    if args.type:
+        allowed = {t.strip().lower() for t in args.type.split(",") if t.strip()}
+        cases = [c for c in cases if c["_type"] in allowed]
+        if not cases:
+            sys.exit(f"[FAIL] 类型 {args.type} 过滤后无用例。可用类型: normal/error/destroy")
     print(f"[INFO] 接口={mod.NAME} 从 {excel} 读取 {len(cases)} 条用例")
     from collections import Counter
     print(f"[INFO] 类型分布: {dict(Counter(c['_type'] for c in cases))}\n")
@@ -313,10 +338,18 @@ def main():
             print(f"\n[RESULT] 插件发送成功 {ok}/{len(plugin_cases)}，耗时 {dt:.3f}s，"
                   f"平均 {len(plugin_cases) / dt:.0f} 条/s")
 
-        # 2) 破坏测试：直写 Redis
+        # 2) 破坏测试：直写 Redis（分 type1/type2 两类）
         if destroy_cases:
-            print(f"\n[DESTROY] 破坏测试 {len(destroy_cases)} 条，直接写 Redis...")
-            ok = sum(1 for c, p in destroy_cases if destroy_write_redis(p, c["_no"]))
+            # 每行可指定 destroy_mode（Excel 列），--destroy-mode 全局覆盖
+            mode_func = (lambda c: args.destroy_mode) if args.destroy_mode else \
+                        (lambda c: (c.get("destroy_mode") or "type1"))
+            cnt1 = sum(1 for c, _ in destroy_cases if mode_func(c) == "type2")
+            cnt2 = len(destroy_cases) - cnt1
+            print(f"\n[DESTROY] 破坏测试共 {len(destroy_cases)} 条（type1 字段对/task乱写: {cnt2}，"
+                  f"type2 字段乱填: {cnt1}），直写 Redis...")
+            ok = sum(1 for c, p in destroy_cases
+                     if destroy_write_redis(p, c["_no"], mode_func(c), args.destroy_server_id))
+            print(f"[DESTROY] 直写成功 {ok}/{len(destroy_cases)}")
 
         print(f"[INFO] 等待 {args.wait}s 收集回复...")
         time.sleep(args.wait)

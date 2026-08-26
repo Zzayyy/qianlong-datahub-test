@@ -229,7 +229,6 @@ DEFAULT_CONFIG = {
     "workers": "4",
     "max": "0",
     "wait": "5.0",
-    "init_wait": "15.0",
     "mock": "1",
     "verify": "1",
     "destroy_via_plugin": "0",
@@ -315,12 +314,6 @@ class MainWindow(QWidget):
         self.spin_wait.setValue(float(self.cfg.get("wait", "5.0")))
         g2.addWidget(self.spin_wait, 1, 1)
 
-        g2.addWidget(QLabel("初始化超时秒数:"), 1, 2)
-        self.spin_init = QDoubleSpinBox()
-        self.spin_init.setRange(1, 300)
-        self.spin_init.setValue(float(self.cfg.get("init_wait", "15.0")))
-        g2.addWidget(self.spin_init, 1, 3)
-
         self.chk_mock = QCheckBox("模拟数据中台应答器 (mock)")
         self.chk_mock.setChecked(self.cfg.get("mock", "1") == "1")
         g2.addWidget(self.chk_mock, 2, 0, 1, 2)
@@ -332,6 +325,20 @@ class MainWindow(QWidget):
         self.chk_destroy_plugin = QCheckBox("破坏数据走插件 (默认直写 Redis)")
         self.chk_destroy_plugin.setChecked(self.cfg.get("destroy_via_plugin", "0") == "1")
         g2.addWidget(self.chk_destroy_plugin, 3, 0, 1, 3)
+
+        # 用例类型过滤（--type）
+        g2.addWidget(QLabel("用例类型:"), 4, 0)
+        type_box = QHBoxLayout()
+        self.chk_type_normal = QCheckBox("normal")
+        self.chk_type_error = QCheckBox("error")
+        self.chk_type_destroy = QCheckBox("destroy")
+        self.chk_type_normal.setChecked(True)
+        self.chk_type_error.setChecked(True)
+        self.chk_type_destroy.setChecked(True)
+        for cb in (self.chk_type_normal, self.chk_type_error, self.chk_type_destroy):
+            type_box.addWidget(cb)
+        type_box.addStretch(1)
+        g2.addLayout(type_box, 4, 1, 1, 3)
         root.addWidget(grp2)
 
         # ---- 远程 Linux ----
@@ -375,6 +382,9 @@ class MainWindow(QWidget):
         btns.addWidget(self.btn_send)
         btns.addWidget(self.btn_stop)
         btns.addWidget(self.btn_clear)
+        self.btn_upload_all = QPushButton("批量上传所有接口数据")
+        self.btn_upload_all.clicked.connect(self.on_upload_all)
+        btns.addWidget(self.btn_upload_all)
         btns.addStretch(1)
         root.addLayout(btns)
 
@@ -442,13 +452,27 @@ class MainWindow(QWidget):
                "--interface", name]
         self.run_local(cmd, on_done=lambda rc: self.update_excel_label())
 
+    def selected_types(self):
+        """返回选中的用例类型列表"""
+        sel = []
+        if self.chk_type_normal.isChecked():
+            sel.append("normal")
+        if self.chk_type_error.isChecked():
+            sel.append("error")
+        if self.chk_type_destroy.isChecked():
+            sel.append("destroy")
+        return sel
+
     def build_send_cmd(self, name):
         """构造 send_test.py 的命令行"""
         parts = ["python3", "send_test.py", "--interface", name,
                  "--workers", str(self.spin_workers.value()),
                  "--max", str(self.spin_max.value()),
-                 "--wait", str(self.spin_wait.value()),
-                 "--init-wait", str(self.spin_init.value())]
+                 "--wait", str(self.spin_wait.value())]
+        types = self.selected_types()
+        if types and len(types) < 3:
+            parts.append("--type")
+            parts.append(",".join(types))
         if self.chk_mock.isChecked():
             parts.append("--mock")
         else:
@@ -481,12 +505,41 @@ class MainWindow(QWidget):
             "workers": str(self.spin_workers.value()),
             "max": str(self.spin_max.value()),
             "wait": str(self.spin_wait.value()),
-            "init_wait": str(self.spin_init.value()),
             "mock": "1" if self.chk_mock.isChecked() else "0",
             "verify": "1" if self.chk_verify.isChecked() else "0",
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
         }
         save_config(cfg)
+
+    def on_upload_all(self):
+        """批量上传所有接口数据(xlsx) + 接口定义(py)到远程"""
+        if not self.chk_remote.isChecked():
+            QMessageBox.warning(self, "提示", "请先勾选“启用远程执行”")
+            return
+        rd = self.edit_remote_dir.text().strip()
+        files = []
+        # 所有接口定义 py
+        for f in sorted(os.listdir(INTERFACES_DIR)):
+            if f.endswith(".py"):
+                files.append((os.path.join(INTERFACES_DIR, f), f"{rd}/interfaces/{f}"))
+        # 所有数据 xlsx
+        if os.path.isdir(DATA_DIR):
+            for f in sorted(os.listdir(DATA_DIR)):
+                if f.endswith(".xlsx") and not f.startswith("~$"):
+                    files.append((os.path.join(DATA_DIR, f), f"{rd}/data/{f}"))
+        # 脚本文件
+        for f in ("send_test.py", "mock_datahub.py", "make_excel.py"):
+            files.append((os.path.join(BASE_DIR, f), f"{rd}/{f}"))
+
+        self._save_ui_config()
+        self.set_running(True)
+        self.append_log(f"[SSH] 批量上传 {len(files)} 个文件到 {rd}...")
+        self.worker = SshWorker(self.edit_host.text().strip(), self.spin_ssh_port.value(),
+                                self.edit_user.text().strip(), self.edit_pass.text(),
+                                rd, "echo '上传完成'", files, self)
+        self.worker.line.connect(self.append_log)
+        self.worker.finished.connect(lambda rc: self.set_running(False))
+        self.worker.start()
 
     def on_send(self):
         self._save_ui_config()
@@ -500,8 +553,11 @@ class MainWindow(QWidget):
                    "--interface", name,
                    "--workers", str(self.spin_workers.value()),
                    "--max", str(self.spin_max.value()),
-                   "--wait", str(self.spin_wait.value()),
-                   "--init-wait", str(self.spin_init.value())]
+                   "--wait", str(self.spin_wait.value())]
+            types = self.selected_types()
+            if types and len(types) < 3:
+                cmd.append("--type")
+                cmd.append(",".join(types))
             if self.chk_mock.isChecked():
                 cmd.append("--mock")
             else:
