@@ -207,21 +207,69 @@ class DataHubClient:
 # 破坏测试分两类：
 #   type1 - 核心字段正确，task 乱写（测数据中台对畸形业务数据的处理）
 #   type2 - 核心字段乱填（测数据中台对异常来源消息的处理）
+# type2 固定模板轮换（按 req_id 稳定哈希取模，保证可复现）：
+#   {req_id} 会被替换为实际用例编号。每套组合覆盖一类破坏：
+#   0 特殊符号+超大数字 / 1 类型错误 / 2 超长溢出 / 3 空值空白 / 4 控制字符 / 5 混合乱填
+_TYPE2_TEMPLATES = [
+    {  # 0 特殊符号包裹 + 超大数字 + 乱值
+        "request_id": "$$${req_id}###",
+        "server_id": "999999999999",
+        "server_type": "XXX",
+        "reply_req_stream": "no_such_stream",
+        "reply_reply_stream": "garbage_reply",
+    },
+    {  # 1 类型错误：server_id 喂非数字（其余字段正常）
+        "request_id": "$$${req_id}###",
+        "server_id": "abc",
+        "server_type": "WT",
+        "reply_req_stream": "WT-abc",
+        "reply_reply_stream": "WT-abc-reply",
+    },
+    {  # 2 超长溢出：各字段塞超长串
+        "request_id": "{req_id}" + "X" * 200,
+        "server_id": "123456789012345678901234567890",
+        "server_type": "A" * 300,
+        "reply_req_stream": "S" * 200,
+        "reply_reply_stream": "R" * 200,
+    },
+    {  # 3 空值/空白
+        "request_id": "",
+        "server_id": "   ",
+        "server_type": "",
+        "reply_req_stream": " ",
+        "reply_reply_stream": "",
+    },
+    {  # 4 控制字符/特殊符号
+        "request_id": "WT\x00\x01-{req_id}",
+        "server_id": "1e5",
+        "server_type": "W\x02T",
+        "reply_req_stream": "WT-\x03-0",
+        "reply_reply_stream": "reply\x00garbage",
+    },
+    {  # 5 混合乱填：十六进制+乱值+不存在的流
+        "request_id": "###{req_id}%%%",
+        "server_id": "0x1F",
+        "server_type": "sysadmin",
+        "reply_req_stream": "wrong_stream_123",
+        "reply_reply_stream": "???",
+    },
+]
+
+
 def destroy_write_redis(payload, req_id, destroy_mode="type1", server_id="12345"):
     """绕过插件，直接向 DataHub_req_stream 写入破坏数据。返回 True=成功。"""
     try:
         conn = RespClient(REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, db=REDIS_SELECT)
         conn.connect()
         if destroy_mode == "type2":
-            # 类2：核心字段乱填
+            # 类2：核心字段乱填。按 req_id 稳定哈希取整套模板，保证可复现
+            idx = sum(ord(ch) for ch in str(req_id)) % len(_TYPE2_TEMPLATES)
+            tpl = _TYPE2_TEMPLATES[idx]
             fields = {
-                "request_id": "$$$" + str(req_id) + "###",
-                "server_id": "999999999999",
-                "server_type": "XXX",
-                "reply_req_stream": "no_such_stream",
-                "reply_reply_stream": "garbage_reply",
-                "task": payload,
+                k: v.format(req_id=req_id) if isinstance(v, str) else v
+                for k, v in tpl.items()
             }
+            fields["task"] = payload
         else:
             # 类1：核心字段正确（对齐插件真实值），task 乱写
             fields = {
@@ -239,7 +287,9 @@ def destroy_write_redis(payload, req_id, destroy_mode="type1", server_id="12345"
             flat.append(v)
         conn.cmd("XADD", REQ_STREAM, "*", *flat)
         conn.close()
-        print(f"  [DESTROY/{destroy_mode}] 已直写 DataHub_req_stream: {req_id}")
+        tag = f"#{idx}" if destroy_mode == "type2" else ""
+        print(f"  [DESTROY/{destroy_mode}{tag}] 已直写 DataHub_req_stream: {req_id}"
+              f" server_id={fields.get('server_id', '')}")
         return True
     except Exception as e:
         print(f"  [DESTROY] 失败 {req_id}: {e}")
@@ -265,7 +315,7 @@ def main():
     ap.add_argument("--destroy-via-plugin", action="store_true",
                     help="破坏数据也走插件 SendMQ（默认直接写 Redis）")
     ap.add_argument("--destroy-mode", default="",
-                    help="破坏测试类型(type1/type2)，空=按 Excel 行级 destroy_mode 列，默认 type1")
+                    help="破坏测试类型(type1/type2/mixed)，mixed=交替；空=按 Excel 行级 destroy_mode 列，默认 type1")
     ap.add_argument("--destroy-server-id", default="12345",
                     help="type1 用的 server_id（默认 12345，与 mock 应答一致）")
     ap.add_argument("--no-stats", dest="stats", action="store_false", default=True,
@@ -402,18 +452,24 @@ def main():
 
         # 2) 破坏测试：直写 Redis（分 type1/type2 两类）
         if destroy_cases:
-            # 每行可指定 destroy_mode（Excel 列），--destroy-mode 全局覆盖
-            mode_func = (lambda c: args.destroy_mode) if args.destroy_mode else \
-                        (lambda c: (c.get("destroy_mode") or "type1"))
-            cnt1 = sum(1 for c, _ in destroy_cases if mode_func(c) == "type2")
+            # --destroy-mode: type1/type2/mixed；空=按 Excel 行级 destroy_mode 列，默认 type1
+            # mixed = 按顺序交替 type1/type2
+            if args.destroy_mode == "mixed":
+                mode_func = lambda c, i: ("type1" if i % 2 == 0 else "type2")
+            elif args.destroy_mode:
+                mode_func = lambda c, i: args.destroy_mode
+            else:
+                mode_func = lambda c, i: (c.get("destroy_mode") or "type1")
+            cnt1 = sum(1 for i, (c, _) in enumerate(destroy_cases) if mode_func(c, i) == "type2")
             cnt2 = len(destroy_cases) - cnt1
-            print(f"\n[DESTROY] 破坏测试共 {len(destroy_cases)} 条（type1 字段对/task乱写: {cnt2}，"
-                  f"type2 字段乱填: {cnt1}），直写 Redis...")
+            print(f"\n[DESTROY] 破坏测试共 {len(destroy_cases)} 条"
+                  f"（type1 核心字段正常/业务数据畸形: {cnt2}，"
+                  f"type2 核心字段乱填: {cnt1}），直写 Redis...")
             t0 = time.time()
             ok = 0
-            for c, p in destroy_cases:
+            for i, (c, p) in enumerate(destroy_cases):
                 ts = time.perf_counter()
-                ret = destroy_write_redis(p, c["_no"], mode_func(c), args.destroy_server_id)
+                ret = destroy_write_redis(p, c["_no"], mode_func(c, i), args.destroy_server_id)
                 us = (time.perf_counter() - ts) * 1e6
                 if stats:
                     stats.record_send(ret, len(p.encode("utf-8")), us)

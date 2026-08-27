@@ -393,6 +393,7 @@ DEFAULT_CONFIG = {
     "mock": "1",
     "verify": "1",
     "destroy_via_plugin": "0",
+    "destroy_mode": "type1",
     "download": "1",
     "download_dir": "out/performance",
 }
@@ -595,6 +596,20 @@ class MainWindow(QWidget):
         self.chk_quiet = QCheckBox("安静模式 (批量压测建议勾选，减少日志)")
         self.chk_quiet.setChecked(True)
         g2.addWidget(self.chk_quiet, 5, 0, 1, 4)
+
+        # 破坏测试类型（直写 Redis 时生效；mixed=交替 type1/type2）
+        g2.addWidget(QLabel("破坏类型:"), 6, 0)
+        self.combo_destroy_mode = QComboBox()
+        self.combo_destroy_mode.addItem("type1 核心字段正常 / 业务数据畸形", "type1")
+        self.combo_destroy_mode.addItem("type2 核心字段乱填", "type2")
+        self.combo_destroy_mode.addItem("mixed 两种交替", "mixed")
+        _dm_idx = self.combo_destroy_mode.findData(self.cfg.get("destroy_mode", "type1"))
+        self.combo_destroy_mode.setCurrentIndex(_dm_idx if _dm_idx >= 0 else 0)
+        self.combo_destroy_mode.setToolTip(
+            "type1：外层核心字段正常，只把业务数据(task)写成畸形\n"
+            "type2：外层核心字段(来源/回执信息)乱填\n"
+            "mixed：两种交替各一半")
+        g2.addWidget(self.combo_destroy_mode, 6, 1, 1, 3)
         left_lay.addWidget(grp2)
 
         # ---- 远程 Linux ----
@@ -972,6 +987,10 @@ class MainWindow(QWidget):
             parts.append("--destroy-via-plugin")
         if self.chk_quiet.isChecked():
             parts.append("--quiet")
+        dm = self.combo_destroy_mode.currentData()
+        if dm and dm != "type1":   # type1 是默认，不传参数
+            parts.append("--destroy-mode")
+            parts.append(dm)
         return " ".join(parts)
 
     def remote_upload_files(self, name):
@@ -999,6 +1018,7 @@ class MainWindow(QWidget):
             "mock": "1" if self.chk_mock.isChecked() else "0",
             "verify": "1" if self.chk_verify.isChecked() else "0",
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
+            "destroy_mode": self.combo_destroy_mode.currentData() or "type1",
             "download": "1" if self.chk_download.isChecked() else "0",
             "download_dir": self.edit_download_dir.text().strip() or DEFAULT_CONFIG["download_dir"],
         }
