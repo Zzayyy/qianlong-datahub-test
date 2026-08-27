@@ -11,9 +11,14 @@
 依赖：venv 环境已装 PySide6 + paramiko（pip install PySide6 paramiko）
 运行：venv/Scripts/python.exe gui_test.py
 """
+import json
 import os
 import subprocess
 import sys
+import time
+
+# 屏蔽 Qt 在 Windows 上枚举旧系统字体失败的无害警告（Fixedsys/MS Sans Serif 等）
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts.warning=false")
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont, QTextCursor
@@ -22,12 +27,16 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QCheckBox, QLineEdit, QTextEdit, QGroupBox,
     QGridLayout, QVBoxLayout, QHBoxLayout, QMessageBox,
     QListWidget, QListWidgetItem, QAbstractItemView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 INTERFACES_DIR = os.path.join(BASE_DIR, "interfaces")
 PYTHON = sys.executable
+
+# 日志区最大行数：超出后丢弃最旧的行，防止日志过多导致界面卡死
+MAX_LOG_LINES = 3000
 
 
 def list_interfaces():
@@ -107,6 +116,7 @@ class SshWorker(QThread):
         self.ini_update = ini_update
         self._client = None
         self._chan = None
+        self._result_snap = {}   # 执行前的远程结果目录快照 {文件名: mtime}
 
     def run(self):
         try:
@@ -199,6 +209,8 @@ class SshWorker(QThread):
             # 远程执行
             full_cmd = f"cd {self.remote_dir} && {self.command}"
             self.line.emit(f"$ {full_cmd}")
+            # 记录结果目录快照：执行后只下载本次新增/更新的文件，避免全量下载历史版本
+            self._result_snap = self._snapshot_results() if self.download_config else {}
             self._chan = self._client.get_transport().open_session()
             self._chan.settimeout(0)
             self._chan.exec_command(full_cmd)
@@ -244,8 +256,24 @@ class SshWorker(QThread):
                 except Exception:
                     pass
 
+    def _snapshot_results(self):
+        """记录远程结果目录现有文件 {文件名: mtime}，用于区分本次新增"""
+        try:
+            sftp = self._client.open_sftp()
+            try:
+                snap = {}
+                for attr in sftp.listdir_attr(self.download_config["remote"]):
+                    snap[attr.filename] = attr.st_mtime
+                return snap
+            except IOError:
+                return {}
+            finally:
+                sftp.close()
+        except Exception:
+            return {}
+
     def _download_results(self, rc):
-        """执行完后，从远程下载匹配的文件（性能统计 Excel/log）"""
+        """执行完后，只下载本次新增/更新的结果文件（Excel/log/stats JSON）"""
         cfg = self.download_config
         remote_dir = cfg["remote"]
         local_dir = cfg["local"]
@@ -261,21 +289,31 @@ class SshWorker(QThread):
             import fnmatch
             remote_files = sorted(files, key=lambda a: a.st_mtime, reverse=True)
             downloaded = 0
+            skipped = 0
             for attr in remote_files:
                 name = attr.filename
-                if any(fnmatch.fnmatch(name, p) for p in patterns):
-                    remote_path = f"{remote_dir}/{name}"
-                    local_path = os.path.join(local_dir, name)
-                    try:
-                        sftp.get(remote_path, local_path)
-                        self.line.emit(f"[SSH] 已下载结果: {local_path}")
-                        downloaded += 1
-                    except Exception as e:
-                        self.line.emit(f"[SSH] 下载 {name} 失败: {e}")
+                if not any(fnmatch.fnmatch(name, p) for p in patterns):
+                    continue
+                old_mtime = self._result_snap.get(name)
+                if old_mtime is not None and attr.st_mtime <= old_mtime + 0.001:
+                    skipped += 1      # 历史文件，本次未更新
+                    continue
+                remote_path = f"{remote_dir}/{name}"
+                local_path = os.path.join(local_dir, name)
+                try:
+                    sftp.get(remote_path, local_path)
+                    self.line.emit(f"[SSH] 已下载结果: {local_path}")
+                    downloaded += 1
+                except Exception as e:
+                    self.line.emit(f"[SSH] 下载 {name} 失败: {e}")
             if downloaded == 0:
-                self.line.emit(f"[SSH] 远程 {remote_dir} 无匹配文件（未生成统计结果）")
+                if skipped:
+                    self.line.emit(f"[SSH] 远程无本次新增结果文件（跳过历史文件 {skipped} 个）")
+                else:
+                    self.line.emit(f"[SSH] 远程 {remote_dir} 无匹配文件（未生成统计结果）")
             else:
-                self.line.emit(f"[SSH] 结果保存在: {local_dir}")
+                self.line.emit(f"[SSH] 结果保存在: {local_dir}"
+                               + (f"（跳过历史文件 {skipped} 个）" if skipped else ""))
         finally:
             sftp.close()
 
@@ -299,6 +337,47 @@ class SshWorker(QThread):
             pass
 
 
+# ==================== 批量汇总加载线程 ====================
+class SummaryLoader(QThread):
+    """后台扫描下载目录 *_stats.json 并解析（磁盘 IO 不阻塞 GUI）"""
+    done = Signal(object, int, str)   # (rows, file_count, error)
+
+    def __init__(self, download_dir, batch_start, parent=None):
+        super().__init__(parent)
+        self.download_dir = download_dir
+        self.batch_start = batch_start
+
+    def run(self):
+        try:
+            files = []
+            if os.path.isdir(self.download_dir):
+                for fn in os.listdir(self.download_dir):
+                    if fn.endswith("_stats.json"):
+                        full = os.path.join(self.download_dir, fn)
+                        try:
+                            with open(full, encoding="utf-8") as f:
+                                data = json.load(f)
+                        except Exception:
+                            continue
+                        try:
+                            files.append((os.path.getmtime(full), full, data))
+                        except Exception:
+                            continue
+            if self.batch_start:
+                # 只统计本次批量开始后下载的文件
+                files = [x for x in files if x[0] >= self.batch_start - 5]
+            file_count = len(files)
+            by_name = {}
+            for _mtime, full, data in sorted(files, key=lambda x: x[0]):
+                if isinstance(data, dict):
+                    by_name[data.get("interface") or os.path.basename(full)] = data
+            rows = [(n, d["summary"]) for n, d in by_name.items()
+                    if isinstance(d, dict) and isinstance(d.get("summary"), dict)]
+            self.done.emit(rows, file_count, "")
+        except Exception as e:
+            self.done.emit([], 0, str(e))
+
+
 # ==================== 配置 ====================
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 
@@ -317,6 +396,27 @@ DEFAULT_CONFIG = {
     "download": "1",
     "download_dir": "out/performance",
 }
+
+# 批量汇总表格列：(表头, summary JSON 里的键)。interface 取顶层字段
+SUMMARY_COLS = [
+    ("接口", "interface"),
+    ("总请求数", "总请求数"),
+    ("成功", "成功数"),
+    ("失败", "失败数"),
+    ("成功率%", "成功率%"),
+    ("吞吐(条/s)", "吞吐(条/s,按发送耗时)"),
+    ("CPU平均%", "CPU平均%"),
+    ("CPU峰值%", "CPU峰值%"),
+    ("Redis写入", "Redis写入增量"),
+    ("发送耗时(s)", "发送耗时(s)"),
+    ("总耗时(s)", "总耗时(含等待,s)"),
+    ("请求KB/s", "请求字节(KB/s,按发送耗时)"),
+    ("SendMQ均(µs)", "SendMQ平均(µs)"),
+    ("p50(µs)", "SendMQ p50(µs)"),
+    ("p90(µs)", "SendMQ p90(µs)"),
+    ("p99(µs)", "SendMQ p99(µs)"),
+    ("max(µs)", "SendMQ max(µs)"),
+]
 
 
 def load_config():
@@ -354,12 +454,13 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("数据中台压力测试工具 (DataHub 压测客户端)")
-        self.resize(900, 900)
+        self.resize(1380, 940)
         self.worker = None
         self.cfg = load_config()
         self._batch_names = []
         self._batch_idx = 0
         self._batch_stopped = False
+        self._batch_start = 0        # 本次批量开始时间戳（汇总过滤用）
         self._build_ui()
 
     def _build_ui(self):
@@ -373,30 +474,49 @@ class MainWindow(QWidget):
         title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(title_lbl)
 
-        # ---- 1. 测试数据（接口多选）----
-        grp1 = QGroupBox("1. 测试数据 (选择要发送的接口，可多选)")
+        # ---- 主体左右分栏：左=配置+日志，右=批量汇总分析 ----
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        left_w = QWidget()
+        left_lay = QVBoxLayout(left_w)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        right_w = QWidget()
+        right_lay = QVBoxLayout(right_w)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+
+        # ---- 1. 测试数据（接口复选框平铺）----
+        grp1 = QGroupBox("1. 测试数据 (勾选要发送的接口)")
         g1 = QGridLayout(grp1)
-        self.list_ifaces = QListWidget()
-        self.list_ifaces.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        for name in list_interfaces():
-            item = QListWidgetItem(name)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked)   # 默认全选
-            self.list_ifaces.addItem(item)
-        g1.addWidget(self.list_ifaces, 0, 0, 3, 1)
+        names = list_interfaces()
+        self.chk_ifaces = {}     # name -> QCheckBox
+        cols = 3
+        for i, name in enumerate(names):
+            chk = QCheckBox(name)
+            chk.setChecked(True)              # 默认全选
+            chk.toggled.connect(self.update_interfaces_label)
+            self.chk_ifaces[name] = chk
+            g1.addWidget(chk, i // cols, i % cols)
+
+        # 右侧：已选计数 + 全选/清空/生成
+        right = QVBoxLayout()
+        self.lbl_excel = QLabel("")
+        slfont = QFont("Microsoft YaHei", 10)
+        slfont.setBold(True)
+        self.lbl_excel.setFont(slfont)
+        right.addWidget(self.lbl_excel)
+        right.addStretch(1)
         self.btn_sel_all = QPushButton("全选")
         self.btn_sel_all.clicked.connect(lambda: self._set_all_iface(True))
-        g1.addWidget(self.btn_sel_all, 0, 1)
+        right.addWidget(self.btn_sel_all)
         self.btn_sel_none = QPushButton("清空")
         self.btn_sel_none.clicked.connect(lambda: self._set_all_iface(False))
-        g1.addWidget(self.btn_sel_none, 1, 1)
+        right.addWidget(self.btn_sel_none)
         self.btn_make = QPushButton("批量生成 Excel")
         self.btn_make.clicked.connect(self.on_make)
-        g1.addWidget(self.btn_make, 2, 1)
-        self.lbl_excel = QLabel("")
-        g1.addWidget(self.lbl_excel, 0, 2, 2, 1)
-        g1.setColumnStretch(0, 1)
-        root.addWidget(grp1)
+        right.addWidget(self.btn_make)
+        rows = (len(names) + cols - 1) // cols
+        g1.addLayout(right, 0, cols, rows, 1)
+        left_lay.addWidget(grp1)
 
         # ---- 2. Redis 配置（写入远程 DataHub.ini 的 [REDIS] 段）----
         grp_redis = QGroupBox("2. Redis 配置 (保存后插件/mock/统计全部生效)")
@@ -422,7 +542,7 @@ class MainWindow(QWidget):
         self.btn_save_redis = QPushButton("保存到远程")
         self.btn_save_redis.clicked.connect(self.on_save_redis)
         gr.addWidget(self.btn_save_redis, 1, 4)
-        root.addWidget(grp_redis)
+        left_lay.addWidget(grp_redis)
 
         # ---- 发送参数 ----
         grp2 = QGroupBox("3. 发送参数")
@@ -471,7 +591,11 @@ class MainWindow(QWidget):
             type_box.addWidget(cb)
         type_box.addStretch(1)
         g2.addLayout(type_box, 4, 1, 1, 3)
-        root.addWidget(grp2)
+
+        self.chk_quiet = QCheckBox("安静模式 (批量压测建议勾选，减少日志)")
+        self.chk_quiet.setChecked(True)
+        g2.addWidget(self.chk_quiet, 5, 0, 1, 4)
+        left_lay.addWidget(grp2)
 
         # ---- 远程 Linux ----
         grp3 = QGroupBox("4. 远程 Linux (发送测试在其上执行)")
@@ -500,7 +624,7 @@ class MainWindow(QWidget):
         g3.addWidget(QLabel("远程目录:"), 3, 0)
         self.edit_remote_dir = QLineEdit(self.cfg.get("remote_dir", "/home/yangsh/so_test"))
         g3.addWidget(self.edit_remote_dir, 3, 1, 1, 3)
-        root.addWidget(grp3)
+        left_lay.addWidget(grp3)
 
         # ---- 结果保存 ----
         grp4 = QGroupBox("5. 结果保存 (性能统计 Excel/log)")
@@ -514,7 +638,45 @@ class MainWindow(QWidget):
             _dl_dir = os.path.join(BASE_DIR, _dl_dir)
         self.edit_download_dir = QLineEdit(_dl_dir)
         g4.addWidget(self.edit_download_dir, 1, 1, 1, 3)
-        root.addWidget(grp4)
+        left_lay.addWidget(grp4)
+
+        # ---- 6. 批量汇总分析（右侧独立面板，展示全部统计指标）----
+        grp5 = QGroupBox("批量汇总分析 (本次批量各接口统计)")
+        g5 = QVBoxLayout(grp5)
+        top5 = QHBoxLayout()
+        self.lbl_summary_info = QLabel("批量发送完成后自动汇总")
+        self.lbl_summary_info.setStyleSheet("color: #666;")
+        top5.addWidget(self.lbl_summary_info)
+        top5.addStretch(1)
+        self.btn_summary_refresh = QPushButton("刷新汇总")
+        self.btn_summary_refresh.clicked.connect(self._refresh_summary)
+        top5.addWidget(self.btn_summary_refresh)
+        self.btn_summary_export = QPushButton("导出 Excel")
+        self.btn_summary_export.clicked.connect(self.on_export_summary)
+        top5.addWidget(self.btn_summary_export)
+        self.btn_summary_clear = QPushButton("清空")
+        self.btn_summary_clear.clicked.connect(self.on_clear_summary)
+        top5.addWidget(self.btn_summary_clear)
+        g5.addLayout(top5)
+        self.table_summary = QTableWidget(0, len(SUMMARY_COLS))
+        self.table_summary.setHorizontalHeaderLabels([c[0] for c in SUMMARY_COLS])
+        self.table_summary.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_summary.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_summary.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_summary.verticalHeader().setVisible(False)
+        # 列多：接口列拉伸，其余可横向滚动查看
+        hdr = self.table_summary.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setDefaultSectionSize(92)
+        hdr.setMinimumSectionSize(60)
+        self.table_summary.setStyleSheet(
+            "QTableWidget { background: #fafafa; border: 1px solid #ddd; border-radius: 4px; }"
+            "QHeaderView::section { background: #e8f0fe; font-weight: bold;"
+            " border: none; border-right: 1px solid #d0d0d0; padding: 4px; }"
+            "QTableWidget::item { padding: 2px 6px; }")
+        g5.addWidget(self.table_summary)
+        right_lay.addWidget(grp5)
 
         # ---- 操作按钮 ----
         btns = QHBoxLayout()
@@ -532,41 +694,191 @@ class MainWindow(QWidget):
         self.btn_upload_all.clicked.connect(self.on_upload_all)
         btns.addWidget(self.btn_upload_all)
         btns.addStretch(1)
-        root.addLayout(btns)
+        left_lay.addLayout(btns)
 
         # ---- 日志区 ----
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        # 文档最大块数：Qt 内部高效丢弃最旧行，防止日志过多导致渲染卡死
+        self.log.document().setMaximumBlockCount(MAX_LOG_LINES)
         font = QFont("Consolas", 9)
         self.log.setFont(font)
-        root.addWidget(self.log, 1)
+        left_lay.addWidget(self.log, 1)
+
+        # ---- 组装左右分栏 ----
+        splitter.addWidget(left_w)
+        splitter.addWidget(right_w)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([760, 560])
+        root.addWidget(splitter)
 
         self.update_excel_label()
 
     # ---------- 工具 ----------
     def selected_interfaces(self):
         """返回勾选的接口名列表"""
-        names = []
-        for i in range(self.list_ifaces.count()):
-            it = self.list_ifaces.item(i)
-            if it.checkState() == Qt.CheckState.Checked:
-                names.append(it.text())
-        return names
+        return [n for n, chk in self.chk_ifaces.items() if chk.isChecked()]
 
     def _set_all_iface(self, checked):
-        for i in range(self.list_ifaces.count()):
-            it = self.list_ifaces.item(i)
-            it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        for chk in self.chk_ifaces.values():
+            chk.setChecked(checked)
 
     def update_interfaces_label(self):
-        n = len(self.selected_interfaces())
-        total = self.list_ifaces.count()
-        self.lbl_excel.setText(f"已选 {n}/{total} 个接口")
+        sel = self.selected_interfaces()
+        total = len(self.chk_ifaces)
+        if sel:
+            text = f"已选 {len(sel)}/{total}：" + "、".join(sel)
+            if len(text) > 50:
+                text = f"已选 {len(sel)}/{total} 个接口"
+        else:
+            text = "未选择任何接口"
+        self.lbl_excel.setText(text)
 
     def update_excel_label(self):
         self.update_interfaces_label()
 
+    # ---------- 批量汇总 ----------
+    def _download_dir_abs(self):
+        d = self.edit_download_dir.text().strip()
+        if not os.path.isabs(d):
+            d = os.path.join(BASE_DIR, d)
+        return d
+
+    def _safe_float(self, v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _refresh_summary(self):
+        """后台扫描 stats JSON 并填表（磁盘 IO 不阻塞 UI）。
+
+        仅当本次会话运行过发送测试（_batch_start 非 0）才去扫描下载目录，
+        避免显示历史批次的数据。
+        """
+        if not self._batch_start:
+            # 本次会话还没发过测试：无数据可汇总
+            self._fill_summary_table([])
+            self.lbl_summary_info.setText("尚未运行发送测试：请先点击“运行发送测试”，批量结束后自动汇总")
+            return
+        loader = getattr(self, "_summary_loader", None)
+        if loader and loader.isRunning():
+            self.append_log("[汇总] 正在刷新中，请稍候...")
+            return
+        loader = SummaryLoader(self._download_dir_abs(), self._batch_start, self)
+        self._summary_loader = loader
+        self.btn_summary_refresh.setEnabled(False)
+        self.lbl_summary_info.setText("正在扫描统计文件...")
+        loader.done.connect(self._on_summary_loaded)
+        loader.start()
+
+    def _on_summary_loaded(self, rows, file_count, error):
+        """汇总线程完成回调（GUI 主线程）"""
+        if hasattr(self, "btn_summary_refresh"):
+            self.btn_summary_refresh.setEnabled(True)
+        if error:
+            self.append_log(f"[汇总] 刷新失败: {error}")
+            self.lbl_summary_info.setText(f"刷新失败: {error}")
+            return
+        self._fill_summary_table(rows)
+        if rows:
+            self.lbl_summary_info.setText(
+                f"汇总 {len(rows)} 个接口（{file_count} 个统计文件，本次批量）")
+        else:
+            self.lbl_summary_info.setText(
+                "暂无本次批量统计文件（远程未生成 *_stats.json？）")
+
+    def _fill_summary_table(self, rows):
+        """rows: [(接口名, summary dict), ...]。列数固定，禁止自动扩列"""
+        table = self.table_summary
+        table.setColumnCount(len(SUMMARY_COLS))     # 固定列数，杜绝 setItem 越界扩列
+        table.setRowCount(len(rows) + (1 if rows else 0))
+        for r, (name, s) in enumerate(rows):
+            vals = [name] + [s.get(c[1], "") for c in SUMMARY_COLS[1:]]
+            self._set_summary_row(r, vals, bold=False)
+        if rows:
+            n = len(SUMMARY_COLS)
+            agg = [""] * n
+            total = sum(self._safe_float(s.get("总请求数")) for _, s in rows)
+            ok = sum(self._safe_float(s.get("成功数")) for _, s in rows)
+            fail = sum(self._safe_float(s.get("失败数")) for _, s in rows)
+            thr = sum(self._safe_float(s.get("吞吐(条/s,按发送耗时)")) for _, s in rows)
+            cpu_avg = [self._safe_float(s.get("CPU平均%")) for _, s in rows]
+            cpu_avg = [v for v in cpu_avg if v > 0]
+            cpu_peak = [self._safe_float(s.get("CPU峰值%")) for _, s in rows]
+            cpu_peak = [v for v in cpu_peak if v > 0]
+            redis_inc = sum(self._safe_float(s.get("Redis写入增量")) for _, s in rows)
+            agg[0] = "合计"
+            agg[1] = total
+            agg[2] = ok
+            agg[3] = fail
+            agg[4] = round(ok / total * 100, 2) if total else 0
+            agg[5] = round(thr, 2)
+            agg[6] = round(sum(cpu_avg) / len(cpu_avg), 1) if cpu_avg else ""
+            agg[7] = round(max(cpu_peak), 1) if cpu_peak else ""
+            agg[8] = redis_inc
+            self._set_summary_row(len(rows), agg, bold=True)
+
+    def _set_summary_row(self, row, vals, bold=False):
+        table = self.table_summary
+        for c, v in enumerate(vals):
+            if c >= table.columnCount():
+                break
+            item = QTableWidgetItem(str(v))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if bold:
+                f = QFont("Microsoft YaHei", 9)
+                f.setBold(True)
+                item.setFont(f)
+                item.setBackground(Qt.GlobalColor.lightGray)
+            table.setItem(row, c, item)
+
+    def on_clear_summary(self):
+        self.table_summary.setRowCount(0)
+        self.lbl_summary_info.setText("已清空汇总显示（下次批量后自动刷新）")
+
+    def on_export_summary(self):
+        """把汇总表导出为 Excel（所见即所得，含合计行）"""
+        rows = self._collect_summary_rows()
+        if not rows:
+            QMessageBox.warning(self, "提示", "当前没有汇总数据，请先批量发送并刷新")
+            return
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill
+        except ImportError:
+            QMessageBox.warning(self, "提示", "缺少 openpyxl，请先: pip install openpyxl")
+            return
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "批量汇总"
+        ws.append([c[0] for c in SUMMARY_COLS])
+        for c in ws[1]:
+            c.font = Font(bold=True)
+            c.fill = PatternFill("solid", fgColor="E8F0FE")
+        for r in rows:
+            ws.append(r)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self._download_dir_abs(), f"批量汇总_{ts}.xlsx")
+        wb.save(path)
+        self.append_log(f"[EXPORT] 已导出批量汇总: {path}")
+        QMessageBox.information(self, "完成", f"已导出:\n{path}")
+
+    def _collect_summary_rows(self):
+        """从表格控件读取当前所有行数据（含合计）"""
+        table = self.table_summary
+        rows = []
+        for r in range(table.rowCount()):
+            vals = []
+            for c in range(table.columnCount()):
+                it = table.item(r, c)
+                vals.append(it.text() if it else "")
+            rows.append(vals)
+        return rows
+
     def append_log(self, text):
+        # 行数上限由 document().setMaximumBlockCount() 内部高效截断，这里只做追加
         self.log.append(text)
         self.log.moveCursor(QTextCursor.MoveOperation.End)
 
@@ -617,6 +929,9 @@ class MainWindow(QWidget):
         if hasattr(self, "btn_read_redis"):
             self.btn_read_redis.setEnabled(not running)
             self.btn_save_redis.setEnabled(not running)
+        for b in ("btn_summary_refresh", "btn_summary_export"):
+            if hasattr(self, b):
+                getattr(self, b).setEnabled(not running)
 
     # ---------- 操作 ----------
     def on_make(self):
@@ -657,6 +972,8 @@ class MainWindow(QWidget):
             parts.append("--verify")
         if self.chk_destroy_plugin.isChecked():
             parts.append("--destroy-via-plugin")
+        if self.chk_quiet.isChecked():
+            parts.append("--quiet")
         return " ".join(parts)
 
     def remote_upload_files(self, name):
@@ -783,21 +1100,23 @@ class MainWindow(QWidget):
         self._batch_names = names
         self._batch_idx = 0
         self._batch_stopped = False
+        self._batch_start = time.time()
         self.set_running(True)
         if len(names) > 1:
             self.append_log(f"\n[BATCH] 共 {len(names)} 个接口待发送: {', '.join(names)}")
         self._run_next_batch_item()
 
     def _download_config_for(self, name):
-        dl = None
+        """下载配置：stats JSON 始终下载(供汇总分析)；xlsx/log 仅在勾选“自动下载”时下载"""
+        patterns = [f"{name}_*_stats.json"]   # 汇总分析必需（小文件）
         if self.chk_download.isChecked():
-            dl = {
-                "remote": self.edit_remote_dir.text().strip() + "/out/performance",
-                "local": self.edit_download_dir.text().strip() or
-                         os.path.join(BASE_DIR, "out", "performance"),
-                "patterns": [f"{name}_*.xlsx", f"{name}_*.log"],
-            }
-        return dl
+            patterns += [f"{name}_*.xlsx", f"{name}_*.log"]
+        return {
+            "remote": self.edit_remote_dir.text().strip() + "/out/performance",
+            "local": self.edit_download_dir.text().strip() or
+                     os.path.join(BASE_DIR, "out", "performance"),
+            "patterns": patterns,
+        }
 
     def _run_next_batch_item(self):
         if self._batch_stopped:
@@ -808,6 +1127,7 @@ class MainWindow(QWidget):
         idx = self._batch_idx
         if idx >= len(names):
             self.append_log(f"[BATCH] 全部完成（共 {len(names)} 个接口）")
+            self._refresh_summary()   # 汇总分析始终刷新（stats JSON 始终下载）
             self.set_running(False)
             return
         name = names[idx]
@@ -817,7 +1137,7 @@ class MainWindow(QWidget):
         cmd_str = self.build_send_cmd(name)
         local_dl_dir = self.edit_download_dir.text().strip() or \
                        os.path.join(BASE_DIR, "out", "performance")
-        dl = self._download_config_for(name) if self.chk_download.isChecked() else None
+        dl = self._download_config_for(name)
 
         if self.chk_remote.isChecked():
             self.worker = SshWorker(
@@ -867,6 +1187,9 @@ class MainWindow(QWidget):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(3000)
+        loader = getattr(self, "_summary_loader", None)
+        if loader and loader.isRunning():
+            loader.wait(2000)
         event.accept()
 
 

@@ -232,6 +232,11 @@ class PerfStats:
                     return 0.0
                 idx = min(int(len(times) * p), len(times) - 1)
                 return times[idx]
+            # CPU / Redis 真实写入量（按秒采样聚合）
+            # 只统计有实际请求的秒：排除启动/空闲阶段的瞬时尖峰（如插件初始化占满多核）
+            active = [rec for rec in self.per_sec.values() if rec.get("req", 0) > 0]
+            cpu_vals = [rec.get("cpu", 0) for rec in active if rec.get("cpu", 0) > 0]
+            redis_inc = sum(rec.get("xlen_delta", 0) for rec in active)
             return {
                 "总请求数": total,
                 "成功数": self.send_ok,
@@ -248,6 +253,9 @@ class PerfStats:
                 "SendMQ p90(µs)": round(pct(0.90), 1),
                 "SendMQ p99(µs)": round(pct(0.99), 1),
                 "SendMQ max(µs)": round(times[-1], 1) if times else 0.0,
+                "CPU平均%": round(sum(cpu_vals) / len(cpu_vals), 1) if cpu_vals else 0.0,
+                "CPU峰值%": round(max(cpu_vals), 1) if cpu_vals else 0.0,
+                "Redis写入增量": redis_inc,
                 "每秒采样点数": len(self.per_sec),
                 # 数据中台未开放
                 "返回字节(B)": "N/A(数据中台未开放)",

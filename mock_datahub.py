@@ -107,6 +107,16 @@ class RespClient:
         self._write("PUBLISH", channel, msg)
         return self._read()
 
+    def subscribe_many(self, channels):
+        """一次 SUBSCRIBE 多个频道，返回确认的频道列表"""
+        self._write("SUBSCRIBE", *channels)
+        confirmed = []
+        while len(confirmed) < len(channels):
+            resp = self._read()
+            if isinstance(resp, list) and resp and resp[0] == "subscribe":
+                confirmed.append(resp[1])
+        return confirmed
+
     def cmd(self, *args):
         """执行任意命令并返回结果"""
         self._write(*args)
@@ -155,13 +165,38 @@ class MockDataHub:
         self._stop.set()
 
     def _publish(self, channel, msg):
-        """用独立连接发布（订阅连接上不能执行 PUBLISH）"""
-        c = RespClient(self.host, self.port, self.password)
-        c.connect()
-        try:
-            c.publish(channel, msg)
-        finally:
-            c.close()
+        """用常驻的非订阅连接发布（订阅连接上不能执行 PUBLISH）。
+
+        连接复用避免每条应答都重建 TCP+AUTH；断开时自动重建一次。"""
+        pub = getattr(self, "_pub_conn", None)
+        for attempt in (0, 1):   # 失败重建一次
+            try:
+                if pub is None:
+                    pub = RespClient(self.host, self.port, self.password)
+                    pub.connect()
+                    self._pub_conn = pub
+                pub.publish(channel, msg)
+                return
+            except Exception:
+                try:
+                    if pub is not None and pub.sock is not None:
+                        pub.sock.close()
+                except Exception:
+                    pass
+                self._pub_conn = None
+                pub = None
+                if attempt == 1:
+                    raise
+
+    def stop(self):
+        self._stop.set()
+        pub = getattr(self, "_pub_conn", None)
+        if pub:
+            try:
+                pub.close()
+            except Exception:
+                pass
+            self._pub_conn = None
 
     def _run(self):
         while not self._stop.is_set():
@@ -169,9 +204,9 @@ class MockDataHub:
             try:
                 conn = RespClient(self.host, self.port, self.password)
                 conn.connect()
-                print(f"[MOCK] 已订阅频道 {self.channels} (host={self.host})", flush=True)
-                for ch in self.channels:
-                    conn.subscribe(ch)
+                confirmed = conn.subscribe_many(self.channels)
+                print(f"[MOCK] 已订阅 {len(confirmed)} 个频道: {self.channels} "
+                      f"(host={self.host})", flush=True)
                 while not self._stop.is_set():
                     msg = conn.listen(timeout=1.0)
                     if msg is None:

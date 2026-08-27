@@ -53,6 +53,9 @@ REDIS_SELECT = int(os.environ.get("REDISSELECT", "0"))
 # 请求流名（插件/破坏测试都写入这里，数据中台从此消费）
 REQ_STREAM = "DataHub_req_stream"
 
+# 安静模式：不打印每条报文/回复，只输出关键信息（大并发压测时减少 GUI 日志量）
+QUIET = False
+
 
 def load_redis_cfg(cfg_path):
     """从 DataHub.ini 读取 REDIS 配置（插件实际上读这个文件，不是环境变量）"""
@@ -160,7 +163,8 @@ class DataHubClient:
             s2 = data2.decode("utf-8", "replace") if data2 else ""
             with self._lock:
                 self._replies.append((s2, s1))
-            print(f"  [reply] id={msg_id} req_id={s2} data={s1[:200]}")
+            if not QUIET:
+                print(f"  [reply] id={msg_id} req_id={s2} data={s1[:200]}")
 
         self._cb = _ReplyCb(_on_msg)
         self.mq = self.lib.CreateMQ(unique.encode(), cfg_path.encode(), self._cb)
@@ -270,8 +274,16 @@ def main():
                     help="统计输出目录（默认 out/performance/）")
     ap.add_argument("--stats-interval", type=float, default=1.0,
                     help="统计采样间隔秒数")
+    ap.add_argument("--stats-json", action="store_true", default=True,
+                    help="额外保存 summary JSON（供 GUI 批量汇总，默认开）")
+    ap.add_argument("--no-stats-json", dest="stats_json", action="store_false",
+                    help="关闭 summary JSON 保存")
     ap.add_argument("--no-send", action="store_true", help="只生成报文不发送")
+    ap.add_argument("--quiet", action="store_true",
+                    help="安静模式：不打印每条报文/回复，只输出关键信息")
     args = ap.parse_args()
+    global QUIET
+    QUIET = args.quiet
 
     mod = load_interface(args.interface)
     excel = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
@@ -308,7 +320,8 @@ def main():
             print(f"  [WARN] {c['_no']} 报文构造失败: {e}，改用原文案")
             p = str(c.get("case_desc"))
         payloads.append(p)
-        print(f"  {c['_no']} [{c['_type']}] {p[:160]}")
+        if not QUIET:
+            print(f"  {c['_no']} [{c['_type']}] {p[:160]}")
 
     so = find_so(args.so)
     load_redis_cfg(BASE_DIR + "/")
@@ -324,9 +337,12 @@ def main():
         print(f"\n[DONE] 报文预览模式：已保存到 {out}（共 {len(payloads)} 条）")
         return
 
-    client = DataHubClient(so, unique=mod.NAME, reply_flag=args.reply)
+    # ---------- 1) 先启动性能统计与模拟应答器（必须先于 CreateMQ）----------
+    # 插件在 CreateMQ 后立即发布上线(id=-1)；若应答器此时未完成订阅，
+    # 就只能等下一轮心跳（数秒），表现为 inited 前长时间"卡顿"。
+    # 因此顺序必须是：订阅就绪 -> CreateMQ -> 立刻收到上线 -> 即刻应答。
 
-    # 性能统计
+    # 性能统计采样线程
     stats = None
     if args.stats:
         stats = PerfStats(redis_cfg={
@@ -340,9 +356,13 @@ def main():
         beat_channels = ["tradeserver_online"]
         if REDIS_SELECT > 0:
             beat_channels.append(f"tradeserver_online_{REDIS_SELECT}")
-        print(f"[INFO] 启动模拟数据中台应答器，订阅频道 {beat_channels}...")
+        print(f"[INFO] (先于 CreateMQ) 启动模拟数据中台应答器，订阅 {beat_channels}...")
         mock = MockDataHub(REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, channels=beat_channels)
         mock.start()
+        time.sleep(0.3)   # 给订阅握手指令留一点时间
+
+    # ---------- 2) CreateMQ：插件上线后即刻被 mock 应答 ----------
+    client = DataHubClient(so, unique=mod.NAME, reply_flag=args.reply)
 
     try:
         if not client.wait_ready(timeout=args.init_wait):
@@ -432,6 +452,17 @@ def main():
                 except Exception as e:
                     print(f"[WARN] Excel 导出失败: {e}")
                     xlsx_path = None
+                # summary JSON（供 GUI 批量汇总）
+                if args.stats_json:
+                    try:
+                        json_path = os.path.join(out_dir, f"{mod.NAME}_{ts}_stats.json")
+                        with open(json_path, "w", encoding="utf-8") as f:
+                            json.dump({"interface": mod.NAME, "ts": ts,
+                                       "summary": stats.summary()},
+                                      f, ensure_ascii=False, indent=2)
+                        print(f"[STATS] JSON 汇总已保存: {json_path}")
+                    except Exception as e:
+                        print(f"[WARN] JSON 汇总保存失败: {e}")
                 print(f"\n[STATS] 性能统计已保存: {log_path}" + (f" / {xlsx_path}" if xlsx_path else ""))
                 print("[STATS] 汇总:")
                 for k, v in stats.summary().items():
