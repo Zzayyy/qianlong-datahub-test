@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QPushButton, QSpinBox,
     QDoubleSpinBox, QCheckBox, QLineEdit, QTextEdit, QGroupBox,
     QGridLayout, QVBoxLayout, QHBoxLayout, QMessageBox,
+    QListWidget, QListWidgetItem, QAbstractItemView,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -39,28 +40,38 @@ def list_interfaces():
 
 # ==================== 本地 Worker ====================
 class Worker(QThread):
-    """本地子进程执行，实时回传输出"""
+    """本地子进程执行（支持多条命令循环），实时回传输出"""
     line = Signal(str)
     finished = Signal(int)
 
-    def __init__(self, cmd, cwd, parent=None):
+    def __init__(self, cmds, cwd, parent=None):
         super().__init__(parent)
-        self.cmd = cmd
+        # cmds: 单条 [..] 或多条 [[..],[..]]，依次执行
+        if cmds and isinstance(cmds[0], list):
+            self.cmds = cmds
+        else:
+            self.cmds = [cmds]
         self.cwd = cwd
         self._proc = None
 
     def run(self):
+        rc_last = 0
         try:
             env = dict(os.environ)
             env["PYTHONIOENCODING"] = "utf-8"
-            self._proc = subprocess.Popen(
-                self.cmd, cwd=self.cwd, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                errors="replace", bufsize=1, env=env)
-            for out in self._proc.stdout:
-                self.line.emit(out.rstrip("\n"))
-            self._proc.wait()
-            self.finished.emit(self._proc.returncode)
+            for cmd in self.cmds:
+                self.line.emit("$ " + " ".join(cmd))
+                self._proc = subprocess.Popen(
+                    cmd, cwd=self.cwd, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                    errors="replace", bufsize=1, env=env)
+                for out in self._proc.stdout:
+                    self.line.emit(out.rstrip("\n"))
+                self._proc.wait()
+                rc_last = self._proc.returncode
+                if rc_last != 0:
+                    break
+            self.finished.emit(rc_last)
         except Exception as e:
             self.line.emit(f"[ERROR] {e}")
             self.finished.emit(-1)
@@ -80,7 +91,8 @@ class SshWorker(QThread):
     finished = Signal(int)
 
     def __init__(self, host, port, username, password, remote_dir, command,
-                 files_to_upload=None, download_config=None, parent=None):
+                 files_to_upload=None, download_config=None, parent=None,
+                 ini_update=None):
         super().__init__(parent)
         self.host = host
         self.port = port
@@ -91,6 +103,8 @@ class SshWorker(QThread):
         self.files_to_upload = files_to_upload or []
         # download_config: {"remote": 远程目录, "local": 本地目录, "patterns": [glob...]}
         self.download_config = download_config
+        # ini_update: {"kv": {REDISHOST:..., REDISPORT:...}, } 更新远程 DataHub.ini [REDIS] 段
+        self.ini_update = ini_update
         self._client = None
         self._chan = None
 
@@ -108,6 +122,31 @@ class SshWorker(QThread):
                                  username=self.username, password=self.password,
                                  timeout=15)
             self.line.emit(f"[SSH] 已连接 {self.host}")
+
+            # 更新远程 DataHub.ini [REDIS] 段（保留其他段落）
+            if self.ini_update:
+                sftp0 = self._client.open_sftp()
+                try:
+                    ini_path = f"{self.remote_dir}/DataHub.ini"
+                    text = ""
+                    try:
+                        with sftp0.open(ini_path, "r") as fh:
+                            text = fh.read().decode("utf-8", "replace")
+                    except IOError:
+                        text = "[REDIS]\n"
+                    import re
+                    for key, val in self.ini_update["kv"].items():
+                        pat = re.compile(rf"^{key}.*$", re.M)
+                        if pat.search(text):
+                            text = pat.sub(f"{key}={val}", text)
+                        else:
+                            text = text.rstrip("\n") + f"\n{key}={val}\n"
+                    with sftp0.open(ini_path, "w") as fh:
+                        fh.write(text.encode("utf-8"))
+                    for key, val in self.ini_update["kv"].items():
+                        self.line.emit(f"[SSH] DataHub.ini {key}={val}")
+                finally:
+                    sftp0.close()
 
             # 上传文件（数据文件 + 脚本，保持最新）
             if self.files_to_upload:
@@ -314,31 +353,79 @@ def save_config(cfg):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("多线程压测工具")
-        self.resize(820, 720)
+        self.setWindowTitle("数据中台压力测试工具 (DataHub 压测客户端)")
+        self.resize(900, 900)
         self.worker = None
         self.cfg = load_config()
+        self._batch_names = []
+        self._batch_idx = 0
+        self._batch_stopped = False
         self._build_ui()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        # ---- 接口选择 + 生成 Excel ----
-        grp1 = QGroupBox("1. 测试数据 (Excel)")
+        # ---- 标题 ----
+        title_lbl = QLabel("DataHub 数据中台 · 条件单压测工具")
+        tfont = QFont("Microsoft YaHei", 14)
+        tfont.setBold(True)
+        title_lbl.setFont(tfont)
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(title_lbl)
+
+        # ---- 1. 测试数据（接口多选）----
+        grp1 = QGroupBox("1. 测试数据 (选择要发送的接口，可多选)")
         g1 = QGridLayout(grp1)
-        g1.addWidget(QLabel("接口:"), 0, 0)
-        self.cmb_interface = QComboBox()
-        self.cmb_interface.addItems(list_interfaces())
-        g1.addWidget(self.cmb_interface, 0, 1)
-        self.btn_make = QPushButton("生成 Excel")
+        self.list_ifaces = QListWidget()
+        self.list_ifaces.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        for name in list_interfaces():
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)   # 默认全选
+            self.list_ifaces.addItem(item)
+        g1.addWidget(self.list_ifaces, 0, 0, 3, 1)
+        self.btn_sel_all = QPushButton("全选")
+        self.btn_sel_all.clicked.connect(lambda: self._set_all_iface(True))
+        g1.addWidget(self.btn_sel_all, 0, 1)
+        self.btn_sel_none = QPushButton("清空")
+        self.btn_sel_none.clicked.connect(lambda: self._set_all_iface(False))
+        g1.addWidget(self.btn_sel_none, 1, 1)
+        self.btn_make = QPushButton("批量生成 Excel")
         self.btn_make.clicked.connect(self.on_make)
-        g1.addWidget(self.btn_make, 0, 2)
+        g1.addWidget(self.btn_make, 2, 1)
         self.lbl_excel = QLabel("")
-        g1.addWidget(self.lbl_excel, 0, 3)
+        g1.addWidget(self.lbl_excel, 0, 2, 2, 1)
+        g1.setColumnStretch(0, 1)
         root.addWidget(grp1)
 
+        # ---- 2. Redis 配置（写入远程 DataHub.ini 的 [REDIS] 段）----
+        grp_redis = QGroupBox("2. Redis 配置 (保存后插件/mock/统计全部生效)")
+        gr = QGridLayout(grp_redis)
+        gr.addWidget(QLabel("主机:"), 0, 0)
+        self.edit_r_host = QLineEdit(self.cfg.get("r_host", "192.168.1.137"))
+        gr.addWidget(self.edit_r_host, 0, 1)
+        gr.addWidget(QLabel("端口:"), 0, 2)
+        self.edit_r_port = QLineEdit(self.cfg.get("r_port", "6379"))
+        gr.addWidget(self.edit_r_port, 0, 3)
+        gr.addWidget(QLabel("密码:"), 1, 0)
+        self.edit_r_pwd = QLineEdit(self.cfg.get("r_pwd", "QianLong@2026&"))
+        self.edit_r_pwd.setEchoMode(QLineEdit.EchoMode.Password)
+        gr.addWidget(self.edit_r_pwd, 1, 1)
+        gr.addWidget(QLabel("数据库(SELECT):"), 1, 2)
+        self.spin_r_db = QSpinBox()
+        self.spin_r_db.setRange(0, 15)
+        self.spin_r_db.setValue(int(self.cfg.get("r_db", "2")))
+        gr.addWidget(self.spin_r_db, 1, 3)
+        self.btn_read_redis = QPushButton("读取远程配置")
+        self.btn_read_redis.clicked.connect(self.on_read_redis)
+        gr.addWidget(self.btn_read_redis, 0, 4)
+        self.btn_save_redis = QPushButton("保存到远程")
+        self.btn_save_redis.clicked.connect(self.on_save_redis)
+        gr.addWidget(self.btn_save_redis, 1, 4)
+        root.addWidget(grp_redis)
+
         # ---- 发送参数 ----
-        grp2 = QGroupBox("2. 发送参数")
+        grp2 = QGroupBox("3. 发送参数")
         g2 = QGridLayout(grp2)
 
         g2.addWidget(QLabel("并发线程数:"), 0, 0)
@@ -387,7 +474,7 @@ class MainWindow(QWidget):
         root.addWidget(grp2)
 
         # ---- 远程 Linux ----
-        grp3 = QGroupBox("3. 远程 Linux (发送测试在其上执行)")
+        grp3 = QGroupBox("4. 远程 Linux (发送测试在其上执行)")
         g3 = QGridLayout(grp3)
         self.chk_remote = QCheckBox("启用远程执行")
         self.chk_remote.setChecked(True)
@@ -416,7 +503,7 @@ class MainWindow(QWidget):
         root.addWidget(grp3)
 
         # ---- 结果保存 ----
-        grp4 = QGroupBox("4. 结果保存 (性能统计 Excel/log)")
+        grp4 = QGroupBox("5. 结果保存 (性能统计 Excel/log)")
         g4 = QGridLayout(grp4)
         self.chk_download = QCheckBox("自动下载结果到本地电脑")
         self.chk_download.setChecked(self.cfg.get("download", "1") == "1")
@@ -457,20 +544,41 @@ class MainWindow(QWidget):
         self.update_excel_label()
 
     # ---------- 工具 ----------
+    def selected_interfaces(self):
+        """返回勾选的接口名列表"""
+        names = []
+        for i in range(self.list_ifaces.count()):
+            it = self.list_ifaces.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                names.append(it.text())
+        return names
+
+    def _set_all_iface(self, checked):
+        for i in range(self.list_ifaces.count()):
+            it = self.list_ifaces.item(i)
+            it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+
+    def update_interfaces_label(self):
+        n = len(self.selected_interfaces())
+        total = self.list_ifaces.count()
+        self.lbl_excel.setText(f"已选 {n}/{total} 个接口")
+
     def update_excel_label(self):
-        name = self.cmb_interface.currentText()
-        path = os.path.join(DATA_DIR, f"{name}.xlsx")
-        self.lbl_excel.setText(f"data/{name}.xlsx" if os.path.exists(path) else "未生成")
+        self.update_interfaces_label()
 
     def append_log(self, text):
         self.log.append(text)
         self.log.moveCursor(QTextCursor.MoveOperation.End)
 
     def run_local(self, cmd, on_done=None):
-        """本地子进程"""
+        """本地子进程（cmd 为单条或多条命令）"""
+        cmds = cmd if cmd and isinstance(cmd[0], list) else [cmd]
+        if len(cmds) > 1:
+            self.append_log(f"[本地] 共 {len(cmds)} 条命令")
+        else:
+            self.append_log("$ " + " ".join(cmds[0]))
         self.set_running(True)
-        self.append_log("$ " + " ".join(cmd))
-        self.worker = Worker(cmd, BASE_DIR, self)
+        self.worker = Worker(cmds, BASE_DIR, self)
         self.worker.line.connect(self.append_log)
         self.worker.finished.connect(lambda rc: self.on_done(rc, on_done))
         self.worker.start()
@@ -504,13 +612,21 @@ class MainWindow(QWidget):
         self.btn_send.setEnabled(not running)
         self.btn_make.setEnabled(not running)
         self.btn_stop.setEnabled(running)
+        if hasattr(self, "btn_upload_all"):
+            self.btn_upload_all.setEnabled(not running)
+        if hasattr(self, "btn_read_redis"):
+            self.btn_read_redis.setEnabled(not running)
+            self.btn_save_redis.setEnabled(not running)
 
     # ---------- 操作 ----------
     def on_make(self):
-        name = self.cmb_interface.currentText()
-        cmd = [PYTHON, os.path.join(BASE_DIR, "make_excel.py"),
-               "--interface", name]
-        self.run_local(cmd, on_done=lambda rc: self.update_excel_label())
+        names = self.selected_interfaces()
+        if not names:
+            QMessageBox.warning(self, "提示", "请至少勾选一个接口")
+            return
+        cmds = [[PYTHON, os.path.join(BASE_DIR, "make_excel.py"), "--interface", n]
+                for n in names]
+        self.run_local(cmds, on_done=lambda rc: self.update_excel_label())
 
     def selected_types(self):
         """返回选中的用例类型列表"""
@@ -573,6 +689,60 @@ class MainWindow(QWidget):
         }
         save_config(cfg)
 
+    def on_read_redis(self):
+        """从远程拉取 DataHub.ini 的 [REDIS] 段显示到界面"""
+        import paramiko
+        try:
+            c = paramiko.SSHClient()
+            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            c.connect(self.edit_host.text().strip(), port=self.spin_ssh_port.value(),
+                      username=self.edit_user.text().strip(),
+                      password=self.edit_pass.text(), timeout=15)
+            sftp = c.open_sftp()
+            path = f"{self.edit_remote_dir.text().strip()}/DataHub.ini"
+            with sftp.open(path, "r") as fh:
+                text = fh.read().decode("utf-8", "replace")
+            sftp.close()
+            c.close()
+            vals = {}
+            for line in text.splitlines():
+                line = line.strip()
+                for key in ("REDISHOST", "REDISPORT", "REDISPWD", "REDISSELECT"):
+                    if line.startswith(key + "="):
+                        vals[key] = line.split("=", 1)[1].strip()
+            self.edit_r_host.setText(vals.get("REDISHOST", self.edit_r_host.text()))
+            self.edit_r_port.setText(vals.get("REDISPORT", self.edit_r_port.text()))
+            if vals.get("REDISPWD"):
+                self.edit_r_pwd.setText(vals["REDISPWD"])
+            try:
+                self.spin_r_db.setValue(int(vals.get("REDISSELECT", "0")))
+            except ValueError:
+                pass
+            self.append_log(f"[SSH] 已读取远程 Redis 配置: {vals}")
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"读取远程 Redis 配置失败: {e}")
+
+    def on_save_redis(self):
+        """把界面的 Redis 配置写入远程 DataHub.ini [REDIS] 段"""
+        kv = {
+            "REDISHOST": self.edit_r_host.text().strip(),
+            "REDISPORT": self.edit_r_port.text().strip(),
+            "REDISPWD": self.edit_r_pwd.text(),
+            "REDISSELECT": str(self.spin_r_db.value()),
+        }
+        cfg_save = dict(load_config())
+        cfg_save.update({"r_host": kv["REDISHOST"], "r_port": kv["REDISPORT"],
+                         "r_pwd": kv["REDISPWD"], "r_db": kv["REDISSELECT"]})
+        save_config(cfg_save)
+        self._save_ui_config()
+        worker = SshWorker(
+            self.edit_host.text().strip(), self.spin_ssh_port.value(),
+            self.edit_user.text().strip(), self.edit_pass.text(),
+            self.edit_remote_dir.text().strip(), "echo 'Redis配置已更新'",
+            ini_update={"kv": kv}, parent=self)
+        worker.line.connect(self.append_log)
+        worker.start()
+
     def on_upload_all(self):
         """批量上传所有接口数据(xlsx) + 接口定义(py)到远程"""
         if not self.chk_remote.isChecked():
@@ -604,43 +774,90 @@ class MainWindow(QWidget):
         self.worker.start()
 
     def on_send(self):
+        """批量发送：对勾选的每个接口依次执行（远程或本地）"""
+        names = self.selected_interfaces()
+        if not names:
+            QMessageBox.warning(self, "提示", "请至少勾选一个接口")
+            return
         self._save_ui_config()
-        name = self.cmb_interface.currentText()
+        self._batch_names = names
+        self._batch_idx = 0
+        self._batch_stopped = False
+        self.set_running(True)
+        if len(names) > 1:
+            self.append_log(f"\n[BATCH] 共 {len(names)} 个接口待发送: {', '.join(names)}")
+        self._run_next_batch_item()
+
+    def _download_config_for(self, name):
+        dl = None
+        if self.chk_download.isChecked():
+            dl = {
+                "remote": self.edit_remote_dir.text().strip() + "/out/performance",
+                "local": self.edit_download_dir.text().strip() or
+                         os.path.join(BASE_DIR, "out", "performance"),
+                "patterns": [f"{name}_*.xlsx", f"{name}_*.log"],
+            }
+        return dl
+
+    def _run_next_batch_item(self):
+        if self._batch_stopped:
+            self.append_log("[BATCH] 已手动停止")
+            self.set_running(False)
+            return
+        names = self._batch_names
+        idx = self._batch_idx
+        if idx >= len(names):
+            self.append_log(f"[BATCH] 全部完成（共 {len(names)} 个接口）")
+            self.set_running(False)
+            return
+        name = names[idx]
+        if len(names) > 1:
+            self.append_log(f"[BATCH] ({idx + 1}/{len(names)}) 接口 {name} 开始...")
+
         cmd_str = self.build_send_cmd(name)
+        local_dl_dir = self.edit_download_dir.text().strip() or \
+                       os.path.join(BASE_DIR, "out", "performance")
+        dl = self._download_config_for(name) if self.chk_download.isChecked() else None
+
         if self.chk_remote.isChecked():
-            # 勾选"自动下载结果"时，执行完拉回性能统计 Excel/log
-            dl = None
-            if self.chk_download.isChecked():
-                dl = {
-                    "remote": self.edit_remote_dir.text().strip() + "/out/performance",
-                    "local": self.edit_download_dir.text().strip() or
-                             os.path.join(BASE_DIR, "out", "performance"),
-                    "patterns": [f"{name}_*.xlsx", f"{name}_*.log"],
-                }
-            self.run_remote(cmd_str, files_to_upload=self.remote_upload_files(name),
-                            download_config=dl)
+            self.worker = SshWorker(
+                self.edit_host.text().strip(), self.spin_ssh_port.value(),
+                self.edit_user.text().strip(), self.edit_pass.text(),
+                self.edit_remote_dir.text().strip(), cmd_str,
+                files_to_upload=self.remote_upload_files(name),
+                download_config=dl, parent=self)
+            self.worker.line.connect(self.append_log)
+            self.worker.finished.connect(lambda rc: self.on_batch_item_done(rc))
+            self.worker.start()
         else:
-            # 本地：用 venv python 跑，但 .so 在 Linux 时才有真实发送
-            cmd = [PYTHON, os.path.join(BASE_DIR, "send_test.py"),
-                   "--interface", name,
-                   "--workers", str(self.spin_workers.value()),
-                   "--max", str(self.spin_max.value()),
-                   "--wait", str(self.spin_wait.value())]
-            types = self.selected_types()
-            if types and len(types) < 3:
-                cmd.append("--type")
-                cmd.append(",".join(types))
-            if self.chk_mock.isChecked():
-                cmd.append("--mock")
-            else:
-                cmd.append("--no-mock")
-            if self.chk_verify.isChecked():
-                cmd.append("--verify")
-            if self.chk_destroy_plugin.isChecked():
-                cmd.append("--destroy-via-plugin")
-            self.run_local(cmd)
+            # 本地模式（.so 在 Linux 时才有真实发送）
+            args = cmd_str.split()[2:]   # 跳过 "python3 send_test.py"
+            cmd = [PYTHON, os.path.join(BASE_DIR, "send_test.py")] + args
+            self.worker = Worker(cmd, BASE_DIR, self)
+            self.worker.line.connect(self.append_log)
+            self.worker.finished.connect(lambda rc: self.on_batch_item_done(rc))
+            self.worker.start()
+
+    def on_batch_item_done(self, rc):
+        name = self._batch_names[self._batch_idx]
+        self.append_log(f"[BATCH] 接口 {name} 完成，退出码 {rc}")
+        self._batch_idx += 1
+        self._run_next_batch_item()
+
+    def remote_upload_files(self, name):
+        """需要上传到远程的文件列表：脚本 + 公共模块 + 接口定义 + 数据文件 + DataHub.ini"""
+        rd = self.edit_remote_dir.text().strip()
+        return [
+            (os.path.join(BASE_DIR, "send_test.py"), f"{rd}/send_test.py"),
+            (os.path.join(BASE_DIR, "mock_datahub.py"), f"{rd}/mock_datahub.py"),
+            (os.path.join(BASE_DIR, "perf_stats.py"), f"{rd}/perf_stats.py"),
+            (os.path.join(INTERFACES_DIR, "_common.py"), f"{rd}/interfaces/_common.py"),
+            (os.path.join(INTERFACES_DIR, f"{name}.py"), f"{rd}/interfaces/{name}.py"),
+            (os.path.join(DATA_DIR, f"{name}.xlsx"), f"{rd}/data/{name}.xlsx"),
+        ]
 
     def on_stop(self):
+        self._batch_stopped = True
         if self.worker:
             self.worker.stop()
             self.append_log("[STOP] 请求停止...")
