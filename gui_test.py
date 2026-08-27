@@ -728,9 +728,7 @@ class MainWindow(QWidget):
         sel = self.selected_interfaces()
         total = len(self.chk_ifaces)
         if sel:
-            text = f"已选 {len(sel)}/{total}：" + "、".join(sel)
-            if len(text) > 50:
-                text = f"已选 {len(sel)}/{total} 个接口"
+            text = f"已选 {len(sel)}/{total}"
         else:
             text = "未选择任何接口"
         self.lbl_excel.setText(text)
