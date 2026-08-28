@@ -550,7 +550,11 @@ class MainWindow(QWidget):
         # ---- 发送参数 ----
         grp2 = QGroupBox("3. 发送参数")
         g2 = QGridLayout(grp2)
+        # 输入列自动拉伸，让两列输入框宽度均匀分配
+        g2.setColumnStretch(1, 1)
+        g2.setColumnStretch(3, 1)
 
+        # 行0：压测规模（并发 / 条数）
         g2.addWidget(QLabel("并发线程数:"), 0, 0)
         self.spin_workers = QSpinBox()
         self.spin_workers.setRange(1, 500)
@@ -563,12 +567,18 @@ class MainWindow(QWidget):
         self.spin_max.setValue(int(self.cfg.get("max", "0")))
         g2.addWidget(self.spin_max, 0, 3)
 
+        # 行1：等待回复 / 安静模式
         g2.addWidget(QLabel("等待回复秒数:"), 1, 0)
         self.spin_wait = QDoubleSpinBox()
         self.spin_wait.setRange(0, 300)
         self.spin_wait.setValue(float(self.cfg.get("wait", "5.0")))
         g2.addWidget(self.spin_wait, 1, 1)
 
+        self.chk_quiet = QCheckBox("安静模式 (批量压测建议勾选，减少日志)")
+        self.chk_quiet.setChecked(True)
+        g2.addWidget(self.chk_quiet, 1, 2, 1, 2)
+
+        # 行2：发送模式开关
         self.chk_mock = QCheckBox("模拟数据中台应答器 (mock)")
         self.chk_mock.setChecked(self.cfg.get("mock", "1") == "1")
         g2.addWidget(self.chk_mock, 2, 0, 1, 2)
@@ -577,8 +587,8 @@ class MainWindow(QWidget):
         self.chk_destroy_plugin.setChecked(self.cfg.get("destroy_via_plugin", "0") == "1")
         g2.addWidget(self.chk_destroy_plugin, 2, 2, 1, 2)
 
-        # 用例类型过滤（--type）
-        g2.addWidget(QLabel("用例类型:"), 4, 0)
+        # 行3：用例类型过滤（--type）
+        g2.addWidget(QLabel("用例类型:"), 3, 0)
         type_box = QHBoxLayout()
         self.chk_type_normal = QCheckBox("normal")
         self.chk_type_error = QCheckBox("error")
@@ -589,14 +599,10 @@ class MainWindow(QWidget):
         for cb in (self.chk_type_normal, self.chk_type_error, self.chk_type_destroy):
             type_box.addWidget(cb)
         type_box.addStretch(1)
-        g2.addLayout(type_box, 4, 1, 1, 3)
+        g2.addLayout(type_box, 3, 1, 1, 3)
 
-        self.chk_quiet = QCheckBox("安静模式 (批量压测建议勾选，减少日志)")
-        self.chk_quiet.setChecked(True)
-        g2.addWidget(self.chk_quiet, 5, 0, 1, 4)
-
-        # 破坏测试类型（直写 Redis 时生效；mixed=交替 type1/type2）
-        g2.addWidget(QLabel("破坏类型:"), 6, 0)
+        # 行4：破坏测试类型（直写 Redis 时生效；mixed=交替 type1/type2）
+        g2.addWidget(QLabel("破坏类型:"), 4, 0)
         self.combo_destroy_mode = QComboBox()
         self.combo_destroy_mode.addItem("type1 核心字段正常 / 业务数据畸形", "type1")
         self.combo_destroy_mode.addItem("type2 核心字段乱填", "type2")
@@ -607,7 +613,7 @@ class MainWindow(QWidget):
             "type1：外层核心字段正常，只把业务数据(task)写成畸形\n"
             "type2：外层核心字段(来源/回执信息)乱填\n"
             "mixed：两种交替各一半")
-        g2.addWidget(self.combo_destroy_mode, 6, 1, 1, 3)
+        g2.addWidget(self.combo_destroy_mode, 4, 1, 1, 3)
         left_lay.addWidget(grp2)
 
         # ---- 远程 Linux ----
