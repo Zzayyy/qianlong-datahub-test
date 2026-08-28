@@ -463,6 +463,7 @@ class MainWindow(QWidget):
         self._batch_stopped = False
         self._batch_start = 0        # 本次批量开始时间戳（汇总过滤用）
         self._auto_export = False    # 批量完成后自动导出汇总总表
+        self._batch_params = {}      # 本次批量参数快照（导出到汇总 Excel 的"批次信息"sheet）
         self._build_ui()
 
     def _build_ui(self):
@@ -798,7 +799,8 @@ class MainWindow(QWidget):
             # 批量完成后自动导出汇总总表（仅一次）
             if self._auto_export:
                 self._auto_export = False
-                path = self._do_export_summary(self._collect_summary_rows())
+                path = self._do_export_summary(self._collect_summary_rows(),
+                                               self._batch_params)
                 if path:
                     self.append_log(f"[EXPORT] 批量完成，自动导出汇总总表: {path}")
                 else:
@@ -856,8 +858,9 @@ class MainWindow(QWidget):
         self.table_summary.setRowCount(0)
         self.lbl_summary_info.setText("已清空汇总显示（下次批量后自动刷新）")
 
-    def _do_export_summary(self, rows):
-        """把汇总行数据导出为 Excel，返回路径（不弹窗；失败返回 None）"""
+    def _do_export_summary(self, rows, params=None):
+        """把汇总行数据导出为 Excel，返回路径（不弹窗；失败返回 None）。
+        params: 批次参数 dict，写入"批次信息"sheet"""
         try:
             from openpyxl import Workbook
             from openpyxl.styles import Font, PatternFill
@@ -872,6 +875,16 @@ class MainWindow(QWidget):
             c.fill = PatternFill("solid", fgColor="E8F0FE")
         for r in rows:
             ws.append(r)
+        if params:
+            ws2 = wb.create_sheet("批次信息")
+            ws2.append(["参数", "值"])
+            for c in ws2[1]:
+                c.font = Font(bold=True)
+                c.fill = PatternFill("solid", fgColor="E8F0FE")
+            for k, v in params.items():
+                ws2.append([k, v])
+            ws2.column_dimensions["A"].width = 20
+            ws2.column_dimensions["B"].width = 60
         ts = time.strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self._download_dir_abs(), f"批量汇总_{ts}.xlsx")
         wb.save(path)
@@ -883,7 +896,7 @@ class MainWindow(QWidget):
         if not rows:
             QMessageBox.warning(self, "提示", "当前没有汇总数据，请先批量发送并刷新")
             return
-        path = self._do_export_summary(rows)
+        path = self._do_export_summary(rows, self._batch_params)
         if not path:
             QMessageBox.warning(self, "提示", "缺少 openpyxl，请先: pip install openpyxl")
             return
@@ -1128,6 +1141,22 @@ class MainWindow(QWidget):
         self._batch_idx = 0
         self._batch_stopped = False
         self._batch_start = time.time()
+        # 批次参数快照：随汇总总表导出到"批次信息"sheet
+        self._batch_params = {
+            "时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "接口数": len(names),
+            "接口": "、".join(names),
+            "并发线程数(workers)": str(self.spin_workers.value()),
+            "最多条数(max)": str(self.spin_max.value()),
+            "等待回复秒数(wait)": str(self.spin_wait.value()),
+            "模拟应答器(mock)": "开" if self.chk_mock.isChecked() else "关",
+            "破坏数据走插件": "开" if self.chk_destroy_plugin.isChecked() else "关",
+            "破坏类型": self.combo_destroy_mode.currentData() or "type1",
+            "安静模式": "开" if self.chk_quiet.isChecked() else "关",
+            "远程执行": "开" if self.chk_remote.isChecked() else "关",
+            "远程主机": self.edit_host.text().strip(),
+            "远程目录": self.edit_remote_dir.text().strip(),
+        }
         self.set_running(True)
         if len(names) > 1:
             self.append_log(f"\n[BATCH] 共 {len(names)} 个接口待发送: {', '.join(names)}")
