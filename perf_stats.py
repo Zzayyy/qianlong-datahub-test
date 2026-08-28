@@ -263,6 +263,17 @@ class PerfStats:
             }
 
     # ---------- 输出 ----------
+    def detail_text(self):
+        """按秒明细文本（供运行日志末尾追加）"""
+        lines = ["\n" + "=" * 60, "性能统计(按秒明细)", "=" * 60]
+        lines.append("  秒 | 请求数 | 字节数 | 失败 | CPU% | Redis流增量 | SendMQ均µs")
+        with self.lock:
+            for sec, rec in self.per_sec.items():
+                avg = (rec["send_us_sum"] / rec["send_us_n"]) if rec["send_us_n"] else 0
+                lines.append(f"  {rec['sec']} | {rec['req']} | {rec['bytes']} | {rec['fail']} | "
+                             f"{rec['cpu']:.1f} | {rec['xlen_delta']} | {avg:.1f}")
+        return "\n".join(lines)
+
     def save_log(self, path):
         s = self.summary()
         lines = [

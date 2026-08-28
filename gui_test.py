@@ -257,62 +257,63 @@ class SshWorker(QThread):
                     pass
 
     def _snapshot_results(self):
-        """记录远程结果目录现有文件 {文件名: mtime}，用于区分本次新增"""
+        """记录远程结果目录现有文件 {remote#文件名: mtime}，用于区分本次新增"""
         try:
             sftp = self._client.open_sftp()
             try:
                 snap = {}
-                for attr in sftp.listdir_attr(self.download_config["remote"]):
-                    snap[attr.filename] = attr.st_mtime
+                for d in self.download_config.get("dirs", []):
+                    try:
+                        for attr in sftp.listdir_attr(d["remote"]):
+                            snap[f"{d['remote']}#{attr.filename}"] = attr.st_mtime
+                    except IOError:
+                        pass
                 return snap
-            except IOError:
-                return {}
             finally:
                 sftp.close()
         except Exception:
             return {}
 
     def _download_results(self, rc):
-        """执行完后，只下载本次新增/更新的结果文件（Excel/log/stats JSON）"""
+        """执行完后，按目录下载本次新增/更新的结果文件（stats JSON/xlsx/运行日志）"""
         cfg = self.download_config
-        remote_dir = cfg["remote"]
-        local_dir = cfg["local"]
-        patterns = cfg.get("patterns", ["*.xlsx", "*.log"])
-        os.makedirs(local_dir, exist_ok=True)
+        import fnmatch
         sftp = self._client.open_sftp()
         try:
-            try:
-                files = sftp.listdir_attr(remote_dir)
-            except IOError:
-                self.line.emit(f"[SSH] 远程目录 {remote_dir} 不存在，无结果可下载")
-                return
-            import fnmatch
-            remote_files = sorted(files, key=lambda a: a.st_mtime, reverse=True)
             downloaded = 0
             skipped = 0
-            for attr in remote_files:
-                name = attr.filename
-                if not any(fnmatch.fnmatch(name, p) for p in patterns):
-                    continue
-                old_mtime = self._result_snap.get(name)
-                if old_mtime is not None and attr.st_mtime <= old_mtime + 0.001:
-                    skipped += 1      # 历史文件，本次未更新
-                    continue
-                remote_path = f"{remote_dir}/{name}"
-                local_path = os.path.join(local_dir, name)
+            for d in cfg.get("dirs", []):
+                remote_dir = d["remote"]
+                local_dir = d["local"]
+                patterns = d.get("patterns", [])
+                os.makedirs(local_dir, exist_ok=True)
                 try:
-                    sftp.get(remote_path, local_path)
-                    self.line.emit(f"[SSH] 已下载结果: {local_path}")
-                    downloaded += 1
-                except Exception as e:
-                    self.line.emit(f"[SSH] 下载 {name} 失败: {e}")
+                    files = sftp.listdir_attr(remote_dir)
+                except IOError:
+                    self.line.emit(f"[SSH] 远程目录 {remote_dir} 不存在，跳过")
+                    continue
+                for attr in sorted(files, key=lambda a: a.st_mtime, reverse=True):
+                    name = attr.filename
+                    if not any(fnmatch.fnmatch(name, p) for p in patterns):
+                        continue
+                    old_mtime = self._result_snap.get(f"{remote_dir}#{name}")
+                    if old_mtime is not None and attr.st_mtime <= old_mtime + 0.001:
+                        skipped += 1      # 历史文件，本次未更新
+                        continue
+                    local_path = os.path.join(local_dir, name)
+                    try:
+                        sftp.get(f"{remote_dir}/{name}", local_path)
+                        self.line.emit(f"[SSH] 已下载结果: {local_path}")
+                        downloaded += 1
+                    except Exception as e:
+                        self.line.emit(f"[SSH] 下载 {name} 失败: {e}")
             if downloaded == 0:
                 if skipped:
                     self.line.emit(f"[SSH] 远程无本次新增结果文件（跳过历史文件 {skipped} 个）")
                 else:
-                    self.line.emit(f"[SSH] 远程 {remote_dir} 无匹配文件（未生成统计结果）")
+                    self.line.emit("[SSH] 远程无匹配结果文件（未生成统计/日志）")
             else:
-                self.line.emit(f"[SSH] 结果保存在: {local_dir}"
+                self.line.emit(f"[SSH] 结果已下载"
                                + (f"（跳过历史文件 {skipped} 个）" if skipped else ""))
         finally:
             sftp.close()
@@ -461,6 +462,7 @@ class MainWindow(QWidget):
         self._batch_idx = 0
         self._batch_stopped = False
         self._batch_start = 0        # 本次批量开始时间戳（汇总过滤用）
+        self._auto_export = False    # 批量完成后自动导出汇总总表
         self._build_ui()
 
     def _build_ui(self):
@@ -793,6 +795,14 @@ class MainWindow(QWidget):
         if rows:
             self.lbl_summary_info.setText(
                 f"汇总 {len(rows)} 个接口（{file_count} 个统计文件，本次批量）")
+            # 批量完成后自动导出汇总总表（仅一次）
+            if self._auto_export:
+                self._auto_export = False
+                path = self._do_export_summary(self._collect_summary_rows())
+                if path:
+                    self.append_log(f"[EXPORT] 批量完成，自动导出汇总总表: {path}")
+                else:
+                    self.append_log("[WARN] 汇总总表自动导出失败（缺 openpyxl）")
         else:
             self.lbl_summary_info.setText(
                 "暂无本次批量统计文件（远程未生成 *_stats.json？）")
@@ -846,18 +856,13 @@ class MainWindow(QWidget):
         self.table_summary.setRowCount(0)
         self.lbl_summary_info.setText("已清空汇总显示（下次批量后自动刷新）")
 
-    def on_export_summary(self):
-        """把汇总表导出为 Excel（所见即所得，含合计行）"""
-        rows = self._collect_summary_rows()
-        if not rows:
-            QMessageBox.warning(self, "提示", "当前没有汇总数据，请先批量发送并刷新")
-            return
+    def _do_export_summary(self, rows):
+        """把汇总行数据导出为 Excel，返回路径（不弹窗；失败返回 None）"""
         try:
             from openpyxl import Workbook
             from openpyxl.styles import Font, PatternFill
         except ImportError:
-            QMessageBox.warning(self, "提示", "缺少 openpyxl，请先: pip install openpyxl")
-            return
+            return None
         wb = Workbook()
         ws = wb.active
         ws.title = "批量汇总"
@@ -870,6 +875,18 @@ class MainWindow(QWidget):
         ts = time.strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self._download_dir_abs(), f"批量汇总_{ts}.xlsx")
         wb.save(path)
+        return path
+
+    def on_export_summary(self):
+        """把汇总表导出为 Excel（所见即所得，含合计行）"""
+        rows = self._collect_summary_rows()
+        if not rows:
+            QMessageBox.warning(self, "提示", "当前没有汇总数据，请先批量发送并刷新")
+            return
+        path = self._do_export_summary(rows)
+        if not path:
+            QMessageBox.warning(self, "提示", "缺少 openpyxl，请先: pip install openpyxl")
+            return
         self.append_log(f"[EXPORT] 已导出批量汇总: {path}")
         QMessageBox.information(self, "完成", f"已导出:\n{path}")
 
@@ -1117,16 +1134,26 @@ class MainWindow(QWidget):
         self._run_next_batch_item()
 
     def _download_config_for(self, name):
-        """下载配置：stats JSON 始终下载(供汇总分析)；xlsx/log 仅在勾选“自动下载”时下载"""
-        patterns = [f"{name}_*_stats.json"]   # 汇总分析必需（小文件）
+        """下载配置：stats JSON 始终下载(供汇总分析)；xlsx/运行日志仅在勾选“自动下载”时下载"""
+        rd = self.edit_remote_dir.text().strip() + "/out"
+        local_perf = self.edit_download_dir.text().strip() or \
+                     os.path.join(BASE_DIR, "out", "performance")
+        dirs = [
+            {   # 汇总数据源：始终下载（小文件）
+                "remote": rd + "/performance",
+                "local": local_perf,
+                "patterns": [f"{name}_*_stats.json"],
+            },
+        ]
         if self.chk_download.isChecked():
-            patterns += [f"{name}_*.xlsx", f"{name}_*.log"]
-        return {
-            "remote": self.edit_remote_dir.text().strip() + "/out/performance",
-            "local": self.edit_download_dir.text().strip() or
-                     os.path.join(BASE_DIR, "out", "performance"),
-            "patterns": patterns,
-        }
+            dirs[0]["patterns"] += [f"{name}_*.xlsx"]
+            # 运行日志：独立 out/logs 目录，仅勾选时下载
+            dirs.append({
+                "remote": rd + "/logs",
+                "local": os.path.join(os.path.dirname(local_perf), "logs"),
+                "patterns": [f"{name}_*.log"],
+            })
+        return {"dirs": dirs}
 
     def _run_next_batch_item(self):
         if self._batch_stopped:
@@ -1137,6 +1164,7 @@ class MainWindow(QWidget):
         idx = self._batch_idx
         if idx >= len(names):
             self.append_log(f"[BATCH] 全部完成（共 {len(names)} 个接口）")
+            self._auto_export = True
             self._refresh_summary()   # 汇总分析始终刷新（stats JSON 始终下载）
             self.set_running(False)
             return

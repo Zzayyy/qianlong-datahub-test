@@ -57,6 +57,26 @@ REQ_STREAM = "DataHub_req_stream"
 QUIET = False
 
 
+class _Tee:
+    """把 stdout 同时写到终端和运行日志文件（每行即时 flush 到文件）"""
+
+    def __init__(self, stream, file):
+        self.stream = stream
+        self.file = file
+
+    def write(self, data):
+        self.stream.write(data)
+        self.file.write(data)
+        self.file.flush()
+
+    def flush(self):
+        try:
+            self.stream.flush()
+            self.file.flush()
+        except Exception:
+            pass
+
+
 def load_redis_cfg(cfg_path):
     """从 DataHub.ini 读取 REDIS 配置（插件实际上读这个文件，不是环境变量）"""
     global REDIS_HOST, REDIS_PASSWORD, REDIS_PORT, REDIS_SELECT
@@ -335,6 +355,14 @@ def main():
     QUIET = args.quiet
 
     mod = load_interface(args.interface)
+
+    # ---- 运行日志：tee stdout 到文件（排查问题用），统计明细最后追加 ----
+    run_dir = os.path.join(BASE_DIR, "out", "logs")
+    os.makedirs(run_dir, exist_ok=True)
+    run_log = os.path.join(run_dir, f"{mod.NAME}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    _orig_stdout = sys.stdout
+    sys.stdout = _Tee(_orig_stdout, open(run_log, "w", encoding="utf-8"))
+
     excel = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
     cases = load_cases(excel, 0)   # 先读全部
     # --type 过滤：只发指定用例类型（normal/error/destroy，可逗号分隔）
@@ -384,6 +412,8 @@ def main():
             for p in payloads:
                 f.write(p + "\n")
         print(f"\n[DONE] 报文预览模式：已保存到 {out}（共 {len(payloads)} 条）")
+        sys.stdout.flush()
+        sys.stdout = _orig_stdout
         return
 
     # ---------- 1) 先启动性能统计与模拟应答器（必须先于 CreateMQ）----------
@@ -489,21 +519,13 @@ def main():
     finally:
         if mock:
             mock.stop()
-        # 输出性能统计（Excel + log）——放 finally 里，确保一定执行
+        # 汇总数据 + 运行日志收尾
         if stats:
             try:
                 stats.stop()
                 out_dir = args.stats_out or os.path.join(BASE_DIR, "out", "performance")
                 os.makedirs(out_dir, exist_ok=True)
                 ts = time.strftime("%Y%m%d_%H%M%S")
-                log_path = os.path.join(out_dir, f"{mod.NAME}_{ts}.log")
-                xlsx_path = os.path.join(out_dir, f"{mod.NAME}_{ts}.xlsx")
-                stats.save_log(log_path)
-                try:
-                    stats.save_excel(xlsx_path)
-                except Exception as e:
-                    print(f"[WARN] Excel 导出失败: {e}")
-                    xlsx_path = None
                 # summary JSON（供 GUI 批量汇总）
                 if args.stats_json:
                     try:
@@ -515,15 +537,21 @@ def main():
                         print(f"[STATS] JSON 汇总已保存: {json_path}")
                     except Exception as e:
                         print(f"[WARN] JSON 汇总保存失败: {e}")
-                print(f"\n[STATS] 性能统计已保存: {log_path}" + (f" / {xlsx_path}" if xlsx_path else ""))
                 print("[STATS] 汇总:")
                 for k, v in stats.summary().items():
                     print(f"  {k}: {v}")
+                # 按秒明细追加到运行日志
+                with open(run_log, "a", encoding="utf-8") as f:
+                    f.write(stats.detail_text())
+                    f.write("\n")
             except Exception as e:
                 print(f"[WARN] 统计输出失败: {e}")
                 import traceback
                 traceback.print_exc()
+        print(f"[INFO] 运行日志已保存: {run_log}")
         print("[INFO] 插件有后台线程，直接强制退出（跳过 DestroyMQ）")
+        sys.stdout.flush()
+        sys.stdout = _orig_stdout
         os._exit(0)
 
 
