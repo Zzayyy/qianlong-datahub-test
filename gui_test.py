@@ -391,7 +391,6 @@ DEFAULT_CONFIG = {
     "max": "0",
     "wait": "5.0",
     "mock": "1",
-    "verify": "1",
     "destroy_via_plugin": "0",
     "destroy_mode": "type1",
     "download": "1",
@@ -571,13 +570,9 @@ class MainWindow(QWidget):
         self.chk_mock.setChecked(self.cfg.get("mock", "1") == "1")
         g2.addWidget(self.chk_mock, 2, 0, 1, 2)
 
-        self.chk_verify = QCheckBox("发送后验证 Redis")
-        self.chk_verify.setChecked(self.cfg.get("verify", "1") == "1")
-        g2.addWidget(self.chk_verify, 2, 2, 1, 2)
-
         self.chk_destroy_plugin = QCheckBox("破坏数据走插件 (默认直写 Redis)")
         self.chk_destroy_plugin.setChecked(self.cfg.get("destroy_via_plugin", "0") == "1")
-        g2.addWidget(self.chk_destroy_plugin, 3, 0, 1, 3)
+        g2.addWidget(self.chk_destroy_plugin, 2, 2, 1, 2)
 
         # 用例类型过滤（--type）
         g2.addWidget(QLabel("用例类型:"), 4, 0)
@@ -981,8 +976,6 @@ class MainWindow(QWidget):
             parts.append("--mock")
         else:
             parts.append("--no-mock")
-        if self.chk_verify.isChecked():
-            parts.append("--verify")
         if self.chk_destroy_plugin.isChecked():
             parts.append("--destroy-via-plugin")
         if self.chk_quiet.isChecked():
@@ -1016,7 +1009,6 @@ class MainWindow(QWidget):
             "max": str(self.spin_max.value()),
             "wait": str(self.spin_wait.value()),
             "mock": "1" if self.chk_mock.isChecked() else "0",
-            "verify": "1" if self.chk_verify.isChecked() else "0",
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
             "destroy_mode": self.combo_destroy_mode.currentData() or "type1",
             "download": "1" if self.chk_download.isChecked() else "0",

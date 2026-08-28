@@ -311,7 +311,6 @@ def main():
     ap.add_argument("--init-wait", type=float, default=5.0, help="等待插件 inited 最大秒数(兜底超时，正常2-3s即探测到)")
     ap.add_argument("--mock", action="store_true", default=True, help="启动模拟应答器")
     ap.add_argument("--no-mock", dest="mock", action="store_false", help="关闭模拟应答器")
-    ap.add_argument("--verify", action="store_true", help="发送后验证 Redis")
     ap.add_argument("--destroy-via-plugin", action="store_true",
                     help="破坏数据也走插件 SendMQ（默认直接写 Redis）")
     ap.add_argument("--destroy-mode", default="",
@@ -487,9 +486,6 @@ def main():
         for rid, data in client._replies[:10]:
             print(f"    req_id={rid} -> {data[:200]}")
 
-        if args.verify:
-            verify_redis()
-
     finally:
         if mock:
             mock.stop()
@@ -529,22 +525,6 @@ def main():
                 traceback.print_exc()
         print("[INFO] 插件有后台线程，直接强制退出（跳过 DestroyMQ）")
         os._exit(0)
-
-
-def verify_redis():
-    print("\n[VERIFY] 检查 Redis 中的数据...")
-    try:
-        conn = RespClient(REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, db=REDIS_SELECT)
-        conn.connect()
-        for stream in ("DataHub_req_stream",):
-            try:
-                n = conn.cmd("XLEN", stream)
-                print(f"[VERIFY] {stream} 长度: {n}")
-            except Exception as e:
-                print(f"[VERIFY] {stream} XLEN 失败: {e}")
-        conn.close()
-    except Exception as e:
-        print(f"[VERIFY] Redis 连接失败: {e}")
 
 
 if __name__ == "__main__":
