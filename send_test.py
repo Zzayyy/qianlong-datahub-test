@@ -56,6 +56,23 @@ REQ_STREAM = "DataHub_req_stream"
 # 安静模式：不打印每条报文/回复，只输出关键信息（大并发压测时减少 GUI 日志量）
 QUIET = False
 
+# 安静模式下同类错误最多逐条打印的条数，超出后仅计数（避免大批量失败刷爆 GUI 日志）
+_QUIET_ERR_LIMIT = 5
+_quiet_err_count = {}
+
+
+def _log_quiet_error(tag, msg):
+    """错误日志：非安静模式全部打印；安静模式下同类最多打印前 _QUIET_ERR_LIMIT 条。
+
+    成功明细请直接用 `if not QUIET: print(...)`，本函数只用于错误/告警。
+    """
+    n = _quiet_err_count.get(tag, 0) + 1
+    _quiet_err_count[tag] = n
+    if not QUIET or n <= _QUIET_ERR_LIMIT:
+        print(f"  [{tag}] {msg}")
+    elif n == _QUIET_ERR_LIMIT + 1:
+        print(f"  [{tag}] 安静模式：后续同类错误仅计数，不再逐条打印")
+
 
 class _Tee:
     """把 stdout 同时写到终端和运行日志文件（每行即时 flush 到文件）"""
@@ -75,6 +92,11 @@ class _Tee:
             self.file.flush()
         except Exception:
             pass
+
+    def __getattr__(self, name):
+        # 转发其余属性/方法给真实 stdout（isatty/encoding/fileno 等），
+        # 避免第三方库在 tee 期间访问 stdout 其他成员时抛 AttributeError
+        return getattr(self.stream, name)
 
 
 def load_redis_cfg(cfg_path):
@@ -177,12 +199,18 @@ class DataHubClient:
 
         self._replies = []
         self._lock = threading.Lock()
+        self._expect = 0                     # 期望回复条数（0=不限，由 wait_replies 设置）
+        self._replied = threading.Event()    # 收齐期望条数时置位，用于提前结束等待
 
         def _on_msg(msg_id, data1, data2):
             s1 = data1.decode("utf-8", "replace") if data1 else ""
             s2 = data2.decode("utf-8", "replace") if data2 else ""
             with self._lock:
                 self._replies.append((s2, s1))
+                n = len(self._replies)
+            # 收齐期望条数 -> 通知等待方立即返回，不必死等固定秒数
+            if self._expect and n >= self._expect:
+                self._replied.set()
             if not QUIET:
                 print(f"  [reply] id={msg_id} req_id={s2} data={s1[:200]}")
 
@@ -217,8 +245,27 @@ class DataHubClient:
         err = ctypes.create_string_buffer(128)
         ret = self._send_raw(payload, req_id, reply_flag, err)
         if ret < 0:
-            print(f"  [FAIL] send {req_id}: {err.value.decode('utf-8','replace')}")
+            _log_quiet_error("FAIL", f"send {req_id}: {err.value.decode('utf-8','replace')}")
         return ret
+
+    @property
+    def reply_count(self):
+        """已收到的回复条数（回调线程并发写入，读取需加锁）"""
+        with self._lock:
+            return len(self._replies)
+
+    def wait_replies(self, expected=0, timeout=0.0):
+        """等待回复：收齐 expected 条立即返回，否则最多等 timeout 秒。
+
+        expected<=0 表示不限条数，退化为固定等待 timeout 秒（保持旧行为）。
+        返回实际收到的条数。
+        """
+        self._expect = max(0, expected)
+        if self._expect and self.reply_count >= self._expect:
+            return self.reply_count          # 发送期间就已收齐
+        if timeout > 0:
+            self._replied.wait(timeout)
+        return self.reply_count
 
 
 # ==================== 破坏测试：直接写 Redis ====================
@@ -307,12 +354,13 @@ def destroy_write_redis(payload, req_id, destroy_mode="type1", server_id="12345"
             flat.append(v)
         conn.cmd("XADD", REQ_STREAM, "*", *flat)
         conn.close()
-        tag = f"#{idx}" if destroy_mode == "type2" else ""
-        print(f"  [DESTROY/{destroy_mode}{tag}] 已直写 DataHub_req_stream: {req_id}"
-              f" server_id={fields.get('server_id', '')}")
+        if not QUIET:
+            tag = f"#{idx}" if destroy_mode == "type2" else ""
+            print(f"  [DESTROY/{destroy_mode}{tag}] 已直写 DataHub_req_stream: {req_id}"
+                  f" server_id={fields.get('server_id', '')}")
         return True
     except Exception as e:
-        print(f"  [DESTROY] 失败 {req_id}: {e}")
+        _log_quiet_error("DESTROY", f"失败 {req_id}: {e}")
         return False
 
 
@@ -365,6 +413,9 @@ def main():
 
     excel = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
     cases = load_cases(excel, 0)   # 先读全部
+    # 空数据必须在这里拦掉：否则下面 --max 循环扩量时 base 为空会陷入死循环
+    if not cases:
+        sys.exit(f"[FAIL] {excel} 中无有效用例（表头之后没有数据行）")
     # --type 过滤：只发指定用例类型（normal/error/destroy，可逗号分隔）
     if args.type:
         allowed = {t.strip().lower() for t in args.type.split(",") if t.strip()}
@@ -394,7 +445,7 @@ def main():
         try:
             p = json.dumps(mod.build_payload(c), ensure_ascii=False)
         except Exception as e:
-            print(f"  [WARN] {c['_no']} 报文构造失败: {e}，改用原文案")
+            _log_quiet_error("WARN", f"{c['_no']} 报文构造失败: {e}，改用原文案")
             p = str(c.get("case_desc"))
         payloads.append(p)
         if not QUIET:
@@ -504,16 +555,30 @@ def main():
                     stats.record_send(ret, len(p.encode("utf-8")), us)
                 if ret:
                     ok += 1
-            print(f"[DESTROY] 直写成功 {ok}/{len(destroy_cases)}，耗时 {time.time() - t0:.3f}s")
+            failed = len(destroy_cases) - ok
+            print(f"[DESTROY] 直写成功 {ok}/{len(destroy_cases)}，耗时 {time.time() - t0:.3f}s"
+                  + (f"，失败 {failed} 条" if failed else ""))
 
         # 标记发送阶段结束
         if stats:
             stats.mark_send_end()
 
-        print(f"[INFO] 等待 {args.wait}s 收集回复...")
-        time.sleep(args.wait)
-        print(f"[RESULT] 收到回复数: {client.reply_count}")
-        for rid, data in client._replies[:10]:
+        # 收齐即停：期望条数 = 走插件的用例数（destroy 直写 Redis，不产生插件回复）
+        expect = len(plugin_cases)
+        if expect:
+            print(f"[INFO] 等待回复（最多 {args.wait}s，收齐 {expect} 条即停）...")
+            got = client.wait_replies(expect, args.wait)
+            if got >= expect:
+                print(f"[RESULT] 收到回复数: {got}/{expect}（已收齐，提前结束等待）")
+            else:
+                print(f"[RESULT] 收到回复数: {got}/{expect}（超时未收齐，缺 {expect - got} 条）")
+        else:
+            print(f"[INFO] 无走插件的用例，等待 {args.wait}s 收集残留回复...")
+            got = client.wait_replies(0, args.wait)
+            print(f"[RESULT] 收到回复数: {got}")
+        with client._lock:
+            sample = client._replies[:10]
+        for rid, data in sample:
             print(f"    req_id={rid} -> {data[:200]}")
 
     finally:
