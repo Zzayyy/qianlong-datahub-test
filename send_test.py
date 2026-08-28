@@ -553,6 +553,8 @@ def main():
                 us = (time.perf_counter() - ts) * 1e6
                 if stats:
                     stats.record_send(ret, len(p.encode("utf-8")), us)
+                    # XADD 是同步的，成功返回即代表已写入 Redis（精确计数，与请求数对齐）
+                    stats.record_redis_write(ret)
                 if ret:
                     ok += 1
             failed = len(destroy_cases) - ok

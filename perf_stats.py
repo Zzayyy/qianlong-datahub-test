@@ -114,6 +114,7 @@ class PerfStats:
         self.send_times = []           # 每次 SendMQ 耗时（µs）
         self.send_ok = 0
         self.send_fail = 0
+        self.redis_write_ok = 0        # 直写 Redis(XADD) 同步成功数（destroy 测试精确计数）
         self.bytes_ok = 0              # 成功请求的字节
         self.bytes_fail = 0            # 失败请求的字节
         self._sampler = None
@@ -148,6 +149,16 @@ class PerfStats:
                 self.bytes_ok += payload_bytes
             self.send_times.append(elapsed_us)
 
+    def record_redis_write(self, ok):
+        """记录一次直写 Redis(XADD) 的结果。
+
+        destroy 测试走同步 XADD，成功返回即代表已真正写入流，
+        可精确计数，不受采样间隔影响。
+        """
+        with self.lock:
+            if ok:
+                self.redis_write_ok += 1
+
     # ---------- 采样线程 ----------
     def start(self, interval=1.0):
         self.start_ts = time.time()
@@ -161,13 +172,15 @@ class PerfStats:
         if self._sampler:
             self._sampler.join(timeout=3)
         self.stop_ts = time.time()
+        # 先补最后一次采样（拿最终 XLEN），再关连接。
+        # 注意顺序不能反：若先 close 连接，_get_redis_conn() 复用已断开对象，
+        # XLEN 会抛异常返回 None，导致发送末尾的写入永远统计不到。
+        self._sample_once()
         if self.redis_conn:
             try:
                 self.redis_conn.close()
             except Exception:
                 pass
-        # 最后补一次采样（把最后一秒的数据也带上 CPU）
-        self._sample_once()
 
     def _get_redis_conn(self):
         if self.redis_conn is None and self.redis_cfg:
@@ -199,7 +212,9 @@ class PerfStats:
             rec["cpu"] = max(rec["cpu"], cpu)   # 该秒取 CPU 峰值
             if xlen is not None:
                 if self._last_xlen is not None:
-                    rec["xlen_delta"] = max(xlen - self._last_xlen, 0)
+                    d = max(xlen - self._last_xlen, 0)
+                    # 同一秒内可能多次采样（采样线程 + stop() 补采样），增量应累加，不能覆盖
+                    rec["xlen_delta"] = rec["xlen_delta"] + d
                 self._last_xlen = xlen
 
     def _run(self, interval):
@@ -236,7 +251,10 @@ class PerfStats:
             # 只统计有实际请求的秒：排除启动/空闲阶段的瞬时尖峰（如插件初始化占满多核）
             active = [rec for rec in self.per_sec.values() if rec.get("req", 0) > 0]
             cpu_vals = [rec.get("cpu", 0) for rec in active if rec.get("cpu", 0) > 0]
-            redis_inc = sum(rec.get("xlen_delta", 0) for rec in active)
+            # XLEN 采样增量（参考值）：对全部秒求和，避免最后一次补采样落在空闲秒被漏掉
+            redis_inc = sum(rec.get("xlen_delta", 0) for rec in self.per_sec.values())
+            # 有直写 XADD 精确计数则优先使用（destroy 场景与"总请求数"对齐），否则退回采样值
+            redis_written = self.redis_write_ok if self.redis_write_ok else redis_inc
             return {
                 "总请求数": total,
                 "成功数": self.send_ok,
@@ -255,7 +273,8 @@ class PerfStats:
                 "SendMQ max(µs)": round(times[-1], 1) if times else 0.0,
                 "CPU平均%": round(sum(cpu_vals) / len(cpu_vals), 1) if cpu_vals else 0.0,
                 "CPU峰值%": round(max(cpu_vals), 1) if cpu_vals else 0.0,
-                "Redis写入增量": redis_inc,
+                "Redis写入增量": redis_written,
+                "Redis写入(采样参考)": redis_inc,
                 "每秒采样点数": len(self.per_sec),
                 # 数据中台未开放
                 "返回字节(B)": "N/A(数据中台未开放)",
