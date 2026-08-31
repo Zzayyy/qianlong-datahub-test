@@ -112,6 +112,7 @@ class PerfStats:
         self.send_end_ts = None        # 发送阶段结束
         self.per_sec = OrderedDict()   # epoch秒 -> dict
         self.send_times = []           # 每次 SendMQ 耗时（µs）
+        self.xadd_times = []           # 每次直写 XADD 耗时（µs，destroy 测试）
         self.send_ok = 0
         self.send_fail = 0
         self.redis_write_ok = 0        # 直写 Redis(XADD) 同步成功数（destroy 测试精确计数）
@@ -128,18 +129,25 @@ class PerfStats:
         self.send_end_ts = time.time()
 
     # ---------- 记录 ----------
-    def record_send(self, ok, payload_bytes, elapsed_us):
-        """记录一次 SendMQ：成功/字节/耗时(µs)"""
+    def record_send(self, ok, payload_bytes, elapsed_us, kind="sendmq"):
+        """记录一次发送：成功/字节/耗时(µs)。
+        kind="sendmq" 走插件 SendMQ；kind="xadd" 为 destroy 直写 XADD（延迟单独统计）。
+        注意：xadd 场景（pipeline 批量发送）传入的 elapsed_us 为批内平均延迟，非单条真实耗时。"""
         with self.lock:
             sec = int(time.time())
             rec = self.per_sec.setdefault(sec, {
                 "sec": sec, "req": 0, "bytes": 0, "fail": 0,
                 "cpu": 0.0, "xlen_delta": 0, "send_us_sum": 0.0, "send_us_n": 0,
+                "xadd_us_sum": 0.0, "xadd_us_n": 0,
             })
             rec["req"] += 1
             rec["bytes"] += payload_bytes
-            rec["send_us_sum"] += elapsed_us
-            rec["send_us_n"] += 1
+            if kind == "xadd":
+                rec["xadd_us_sum"] += elapsed_us
+                rec["xadd_us_n"] += 1
+            else:
+                rec["send_us_sum"] += elapsed_us
+                rec["send_us_n"] += 1
             if not ok:
                 rec["fail"] += 1
                 self.send_fail += 1
@@ -147,7 +155,10 @@ class PerfStats:
             else:
                 self.send_ok += 1
                 self.bytes_ok += payload_bytes
-            self.send_times.append(elapsed_us)
+            if kind == "xadd":
+                self.xadd_times.append(elapsed_us)
+            else:
+                self.send_times.append(elapsed_us)
 
     def record_redis_write(self, ok):
         """记录一次直写 Redis(XADD) 的结果。
@@ -208,6 +219,7 @@ class PerfStats:
             rec = self.per_sec.setdefault(sec, {
                 "sec": sec, "req": 0, "bytes": 0, "fail": 0,
                 "cpu": 0.0, "xlen_delta": 0, "send_us_sum": 0.0, "send_us_n": 0,
+                "xadd_us_sum": 0.0, "xadd_us_n": 0,
             })
             rec["cpu"] = max(rec["cpu"], cpu)   # 该秒取 CPU 峰值
             if xlen is not None:
@@ -240,13 +252,16 @@ class PerfStats:
             send_dur = 0.0
             if self.send_start_ts and self.send_end_ts:
                 send_dur = max(self.send_end_ts - self.send_start_ts, 1e-6)
-            # SendMQ 耗时分位数
+            # SendMQ 耗时分位数（仅统计走插件的发送；destroy 直写另列 XADD 指标）
             times = sorted(self.send_times)
-            def pct(p):
-                if not times:
-                    return 0.0
-                idx = min(int(len(times) * p), len(times) - 1)
-                return times[idx]
+            xtimes = sorted(self.xadd_times)
+            def pct(p, arr):
+                if not arr:
+                    return "N/A"
+                idx = min(int(len(arr) * p), len(arr) - 1)
+                return round(arr[idx], 1)
+            def avg_us(arr):
+                return round(sum(arr) / len(arr), 1) if arr else "N/A"
             # CPU / Redis 真实写入量（按秒采样聚合）
             # 只统计有实际请求的秒：排除启动/空闲阶段的瞬时尖峰（如插件初始化占满多核）
             active = [rec for rec in self.per_sec.values() if rec.get("req", 0) > 0]
@@ -266,11 +281,17 @@ class PerfStats:
                 "请求总字节(B)": self.bytes_ok + self.bytes_fail,
                 "请求字节(KB/s,按发送耗时)": round((self.bytes_ok + self.bytes_fail) / send_dur / 1024, 2) if send_dur else 0.0,
                 "平均单请求字节(B)": round((self.bytes_ok + self.bytes_fail) / total, 1) if total else 0,
-                "SendMQ平均(µs)": round(sum(times) / len(times), 1) if times else 0.0,
-                "SendMQ p50(µs)": round(pct(0.50), 1),
-                "SendMQ p90(µs)": round(pct(0.90), 1),
-                "SendMQ p99(µs)": round(pct(0.99), 1),
-                "SendMQ max(µs)": round(times[-1], 1) if times else 0.0,
+                "SendMQ平均(µs)": avg_us(times),
+                "SendMQ p50(µs)": pct(0.50, times),
+                "SendMQ p90(µs)": pct(0.90, times),
+                "SendMQ p99(µs)": pct(0.99, times),
+                "SendMQ max(µs)": round(times[-1], 1) if times else "N/A",
+                # destroy 直写 XADD 延迟（pipeline 批量发送时为批内平均，非单条真实耗时）
+                "XADD均(µs)": avg_us(xtimes),
+                "XADD p50(µs)": pct(0.50, xtimes),
+                "XADD p90(µs)": pct(0.90, xtimes),
+                "XADD p99(µs)": pct(0.99, xtimes),
+                "XADD max(µs)": round(xtimes[-1], 1) if xtimes else "N/A",
                 "CPU平均%": round(sum(cpu_vals) / len(cpu_vals), 1) if cpu_vals else 0.0,
                 "CPU峰值%": round(max(cpu_vals), 1) if cpu_vals else 0.0,
                 "Redis写入增量": redis_written,
@@ -285,12 +306,13 @@ class PerfStats:
     def detail_text(self):
         """按秒明细文本（供运行日志末尾追加）"""
         lines = ["\n" + "=" * 60, "性能统计(按秒明细)", "=" * 60]
-        lines.append("  秒 | 请求数 | 字节数 | 失败 | CPU% | Redis流增量 | SendMQ均µs")
+        lines.append("  秒 | 请求数 | 字节数 | 失败 | CPU% | Redis流增量 | SendMQ均µs | XADD均µs")
         with self.lock:
             for sec, rec in self.per_sec.items():
-                avg = (rec["send_us_sum"] / rec["send_us_n"]) if rec["send_us_n"] else 0
+                avg = (rec["send_us_sum"] / rec["send_us_n"]) if rec.get("send_us_n") else 0
+                xavg = (rec["xadd_us_sum"] / rec["xadd_us_n"]) if rec.get("xadd_us_n") else 0
                 lines.append(f"  {rec['sec']} | {rec['req']} | {rec['bytes']} | {rec['fail']} | "
-                             f"{rec['cpu']:.1f} | {rec['xlen_delta']} | {avg:.1f}")
+                             f"{rec['cpu']:.1f} | {rec['xlen_delta']} | {avg:.1f} | {xavg:.1f}")
         return "\n".join(lines)
 
     def save_log(self, path):
@@ -304,12 +326,13 @@ class PerfStats:
             lines.append(f"{k}: {v}")
         lines.append("=" * 60)
         lines.append("按秒明细:")
-        lines.append("  秒 | 请求数 | 字节数 | 失败 | CPU% | Redis流增量 | SendMQ均µs")
+        lines.append("  秒 | 请求数 | 字节数 | 失败 | CPU% | Redis流增量 | SendMQ均µs | XADD均µs")
         with self.lock:
             for sec, rec in self.per_sec.items():
-                avg = (rec["send_us_sum"] / rec["send_us_n"]) if rec["send_us_n"] else 0
+                avg = (rec["send_us_sum"] / rec["send_us_n"]) if rec.get("send_us_n") else 0
+                xavg = (rec["xadd_us_sum"] / rec["xadd_us_n"]) if rec.get("xadd_us_n") else 0
                 lines.append(f"  {rec['sec']} | {rec['req']} | {rec['bytes']} | {rec['fail']} | "
-                             f"{rec['cpu']:.1f} | {rec['xlen_delta']} | {avg:.1f}")
+                             f"{rec['cpu']:.1f} | {rec['xlen_delta']} | {avg:.1f} | {xavg:.1f}")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         return path
@@ -324,15 +347,18 @@ class PerfStats:
         ws = wb.active
         ws.title = "按秒统计"
         bold = Font(bold=True)
-        headers = ["秒", "请求数", "字节数(B)", "失败数", "CPU%", "Redis流增量", "SendMQ平均(µs)"]
+        headers = ["秒", "请求数", "字节数(B)", "失败数", "CPU%", "Redis流增量",
+                   "SendMQ平均(µs)", "XADD平均(µs)"]
         ws.append(headers)
         for c in ws[1]:
             c.font = bold
         with self.lock:
             for sec, rec in self.per_sec.items():
-                avg = (rec["send_us_sum"] / rec["send_us_n"]) if rec["send_us_n"] else 0
+                avg = (rec["send_us_sum"] / rec["send_us_n"]) if rec.get("send_us_n") else 0
+                xavg = (rec["xadd_us_sum"] / rec["xadd_us_n"]) if rec.get("xadd_us_n") else 0
                 ws.append([rec["sec"], rec["req"], rec["bytes"], rec["fail"],
-                           round(rec["cpu"], 1), rec["xlen_delta"], round(avg, 1)])
+                           round(rec["cpu"], 1), rec["xlen_delta"], round(avg, 1),
+                           round(xavg, 1)])
         # Sheet2 汇总
         ws2 = wb.create_sheet("汇总")
         ws2.append(["指标", "值"])

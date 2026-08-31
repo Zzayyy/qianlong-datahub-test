@@ -20,6 +20,7 @@ case_type 分流：
   python send_test.py --interface query --destroy-via-plugin
 """
 import argparse
+import asyncio
 import ctypes
 import importlib
 import json
@@ -38,6 +39,14 @@ sys.path.insert(0, INTERFACES_DIR)
 
 from mock_datahub import MockDataHub, RespClient
 from perf_stats import PerfStats
+
+# redis.asyncio 可用性（redis-py >= 4.2 提供）；
+# 不可用时破坏测试退回串行逐条直写（每条新建连接，性能较低但功能一致）
+try:
+    import redis.asyncio as _aioredis
+    HAS_AIOREDIS = True
+except Exception:
+    HAS_AIOREDIS = False
 
 try:
     from openpyxl import load_workbook
@@ -323,30 +332,37 @@ _TYPE2_TEMPLATES = [
 ]
 
 
+def build_destroy_fields(payload, req_id, destroy_mode="type1", server_id="12345"):
+    """构造破坏数据的 stream 字段。返回 (fields, tpl_idx)；type1 时 tpl_idx=None。"""
+    if destroy_mode == "type2":
+        # 类2：核心字段乱填。按 req_id 稳定哈希取整套模板，保证可复现
+        idx = sum(ord(ch) for ch in str(req_id)) % len(_TYPE2_TEMPLATES)
+        tpl = _TYPE2_TEMPLATES[idx]
+        fields = {
+            k: v.format(req_id=req_id) if isinstance(v, str) else v
+            for k, v in tpl.items()
+        }
+        fields["task"] = payload
+    else:
+        # 类1：核心字段正确（对齐插件真实值），task 乱写
+        idx = None
+        fields = {
+            "request_id": str(req_id),
+            "server_id": server_id,
+            "server_type": "WT",
+            "reply_req_stream": f"WT-{server_id}",
+            "reply_reply_stream": f"WT-{server_id}-reply",
+            "task": payload,   # 畸形 JSON / 超长 / 特殊字符
+        }
+    return fields, idx
+
+
 def destroy_write_redis(payload, req_id, destroy_mode="type1", server_id="12345"):
-    """绕过插件，直接向 DataHub_req_stream 写入破坏数据。返回 True=成功。"""
+    """绕过插件，直接向 DataHub_req_stream 写入破坏数据（串行单条）。返回 True=成功。"""
     try:
         conn = RespClient(REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, db=REDIS_SELECT)
         conn.connect()
-        if destroy_mode == "type2":
-            # 类2：核心字段乱填。按 req_id 稳定哈希取整套模板，保证可复现
-            idx = sum(ord(ch) for ch in str(req_id)) % len(_TYPE2_TEMPLATES)
-            tpl = _TYPE2_TEMPLATES[idx]
-            fields = {
-                k: v.format(req_id=req_id) if isinstance(v, str) else v
-                for k, v in tpl.items()
-            }
-            fields["task"] = payload
-        else:
-            # 类1：核心字段正确（对齐插件真实值），task 乱写
-            fields = {
-                "request_id": str(req_id),
-                "server_id": server_id,
-                "server_type": "WT",
-                "reply_req_stream": f"WT-{server_id}",
-                "reply_reply_stream": f"WT-{server_id}-reply",
-                "task": payload,   # 畸形 JSON / 超长 / 特殊字符
-            }
+        fields, idx = build_destroy_fields(payload, req_id, destroy_mode, server_id)
         # 打平成 field1 value1 field2 value2 ...
         flat = []
         for k, v in fields.items():
@@ -355,13 +371,84 @@ def destroy_write_redis(payload, req_id, destroy_mode="type1", server_id="12345"
         conn.cmd("XADD", REQ_STREAM, "*", *flat)
         conn.close()
         if not QUIET:
-            tag = f"#{idx}" if destroy_mode == "type2" else ""
+            tag = f"#{idx}" if idx is not None else ""
             print(f"  [DESTROY/{destroy_mode}{tag}] 已直写 DataHub_req_stream: {req_id}"
                   f" server_id={fields.get('server_id', '')}")
         return True
     except Exception as e:
         _log_quiet_error("DESTROY", f"失败 {req_id}: {e}")
         return False
+
+
+# ---------------------- 破坏测试批量直写（asyncio + pipeline） ----------------------
+async def _destroy_send_async(items, stats, batch_size=500, concurrency=4):
+    """asyncio 批量 XADD：pipeline 分批 + 并发控制。
+    items: [(payload, req_id, destroy_mode, server_id), ...]
+    返回成功条数。pipeline 无法测单条耗时，record_send 用批内平均延迟近似。"""
+    client = _aioredis.Redis(
+        host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD,
+        db=REDIS_SELECT, decode_responses=True, socket_timeout=10)
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def send_batch(batch):
+        async with sem:
+            flat_list = []
+            for payload, req_id, mode, server_id in batch:
+                fields, _ = build_destroy_fields(payload, req_id, mode, server_id)
+                flat = []
+                for k, v in fields.items():
+                    flat.append(k)
+                    flat.append(v)
+                flat_list.append(flat)
+            t0 = time.perf_counter()
+            pipe = client.pipeline(transaction=False)
+            for flat in flat_list:
+                pipe.execute_command("XADD", REQ_STREAM, "*", *flat)
+            results = await pipe.execute(raise_on_error=False)
+            us = (time.perf_counter() - t0) * 1e6 / max(1, len(batch))
+            ok = 0
+            for (payload, req_id, mode, _sid), flat, r in zip(batch, flat_list, results):
+                ret = not isinstance(r, Exception)
+                ok += ret
+                if stats:
+                    # 延迟为批内平均，kind="xadd" 与 SendMQ 延迟分开统计
+                    stats.record_send(ret, len(payload.encode("utf-8")), us, kind="xadd")
+                    # pipeline 结果确认才算成功写入（精确计数，与请求数对齐）
+                    stats.record_redis_write(ret)
+            return ok
+
+    try:
+        batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+        results = await asyncio.gather(*(send_batch(b) for b in batches),
+                                       return_exceptions=True)
+        ok = sum(r for r in results if isinstance(r, int))
+        for r in results:
+            if isinstance(r, Exception):
+                _log_quiet_error("DESTROY", f"批量直写异常: {r}")
+        return ok
+    finally:
+        await client.aclose()
+
+
+def destroy_write_all(items, stats, batch_size=500, concurrency=4):
+    """破坏测试批量直写总入口。返回 (成功条数, 耗时s, 途径描述)。
+    优先 asyncio+pipeline（连接复用、批量网络往返）；无 redis 库时退回串行逐条。"""
+    if HAS_AIOREDIS:
+        t0 = time.time()
+        ok = asyncio.run(_destroy_send_async(items, stats, batch_size, concurrency))
+        return ok, time.time() - t0, f"asyncio+pipeline(批{batch_size}x并发{concurrency})"
+    # 回退：串行逐条（旧逻辑，不依赖 redis 库）
+    t0 = time.time()
+    ok = 0
+    for payload, req_id, mode, server_id in items:
+        ts = time.perf_counter()
+        ret = destroy_write_redis(payload, req_id, mode, server_id)
+        us = (time.perf_counter() - ts) * 1e6
+        if stats:
+            stats.record_send(ret, len(payload.encode("utf-8")), us, kind="xadd")
+            stats.record_redis_write(ret)
+        ok += ret
+    return ok, time.time() - t0, "串行逐条(未安装redis库)"
 
 
 # ==================== 主流程 ====================
@@ -545,20 +632,12 @@ def main():
             print(f"\n[DESTROY] 破坏测试共 {len(destroy_cases)} 条"
                   f"（type1 核心字段正常/业务数据畸形: {cnt2}，"
                   f"type2 核心字段乱填: {cnt1}），直写 Redis...")
-            t0 = time.time()
-            ok = 0
-            for i, (c, p) in enumerate(destroy_cases):
-                ts = time.perf_counter()
-                ret = destroy_write_redis(p, c["_no"], mode_func(c, i), args.destroy_server_id)
-                us = (time.perf_counter() - ts) * 1e6
-                if stats:
-                    stats.record_send(ret, len(p.encode("utf-8")), us)
-                    # XADD 是同步的，成功返回即代表已写入 Redis（精确计数，与请求数对齐）
-                    stats.record_redis_write(ret)
-                if ret:
-                    ok += 1
+            items = [(p, c["_no"], mode_func(c, i), args.destroy_server_id)
+                     for i, (c, p) in enumerate(destroy_cases)]
+            ok, dt, via = destroy_write_all(items, stats,
+                                            concurrency=max(2, min(args.workers, 8)))
             failed = len(destroy_cases) - ok
-            print(f"[DESTROY] 直写成功 {ok}/{len(destroy_cases)}，耗时 {time.time() - t0:.3f}s"
+            print(f"[DESTROY] 直写成功 {ok}/{len(destroy_cases)}，耗时 {dt:.3f}s，{via}"
                   + (f"，失败 {failed} 条" if failed else ""))
 
         # 标记发送阶段结束

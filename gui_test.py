@@ -417,6 +417,8 @@ SUMMARY_COLS = [
     ("p90(µs)", "SendMQ p90(µs)"),
     ("p99(µs)", "SendMQ p99(µs)"),
     ("max(µs)", "SendMQ max(µs)"),
+    ("XADD均(µs)", "XADD均(µs)"),
+    ("XADD p99(µs)", "XADD p99(µs)"),
 ]
 
 
