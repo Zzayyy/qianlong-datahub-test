@@ -1,0 +1,9 @@
+# ---- 通用 / 远程执行端（Windows GUI 侧） ----
+PySide6>=6.5.0        # gui_test.py 压测 GUI
+paramiko>=3.0.0       # gui_test.py SSH 远程执行/上传下载
+
+# ---- 测试脚本（Windows + Linux 均需） ----
+openpyxl>=3.1.0       # make_excel.py 生成用例 / send_test.py 读取 / perf_stats.py 写统计
+
+# ---- 破坏测试直写 Redis（可选，缺失自动退回串行逐条） ----
+redis>=5.0.0          # send_test.py 用 redis.asyncio 做 pipeline 批量 XADD
