@@ -682,20 +682,22 @@ class MainWindow(QWidget):
         # 行4：破坏测试类型（直写 Redis 时生效；两个维度组合：核心字段 × task 内容）
         g2.addWidget(QLabel("破坏类型:"), 4, 0)
         self.combo_destroy_mode = QComboBox()
-        self.combo_destroy_mode.addItem("type1 核心字段乱填 + 业务数据畸形", "type1")
-        self.combo_destroy_mode.addItem("type2 核心字段乱填 + 业务数据正确", "type2")
-        self.combo_destroy_mode.addItem("type3 核心字段正常 + 非法JSON", "type3")
-        self.combo_destroy_mode.addItem("type4 核心字段正常 + 非协议JSON", "type4")
+        self.combo_destroy_mode.addItem("type1 乱填字段+业务畸形 (测:路由+业务校验)", "type1")
+        self.combo_destroy_mode.addItem("type2 乱填字段+业务正确 (测:路由)", "type2")
+        self.combo_destroy_mode.addItem("type3 正常字段+非法JSON (测:JSON解析)", "type3")
+        self.combo_destroy_mode.addItem("type4 正常字段+非协议JSON (测:协议分发)", "type4")
         self.combo_destroy_mode.addItem("mixed 四种轮发", "mixed")
         _dm_idx = self.combo_destroy_mode.findData(self.cfg.get("destroy_mode", "mixed"))
         self.combo_destroy_mode.setCurrentIndex(_dm_idx if _dm_idx >= 0 else 4)
         self.combo_destroy_mode.setToolTip(
-            "两个维度组合：核心字段(request_id/server_id/reply流) × task内容\n"
-            "type1：核心字段乱填 + 业务数据(task)畸形\n"
-            "type2：核心字段乱填 + 业务数据正确（取第一条 normal 报文）\n"
-            "type3：核心字段正常 + task 非法 JSON（截断/空/纯文本/二进制垃圾）\n"
-            "type4：核心字段正常 + task 合法 JSON 但非协议格式（空对象/数组/未知键）\n"
-            "mixed：四种按顺序轮发")
+            "中台处理链路四道关卡：\n"
+            "  ①来源/路由(核心字段) → ②JSON解析 → ③协议分发(create/query键) → ④业务校验(字段值)\n"
+            "type1：核心字段乱填 + 业务数据(task)畸形 —— 破坏①+④，双重破坏\n"
+            "type2：核心字段乱填 + 业务正确(取第一条normal报文) —— 只破坏①，测误路由\n"
+            "type3：核心字段正常 + task非法JSON(截断/空/二进制) —— 破坏②，测解析容错不崩溃\n"
+            "type4：核心字段正常 + task合法JSON但非协议格式 —— 破坏③，测未知结构的分发容错\n"
+            "mixed：四种按顺序轮发\n"
+            "对比：error用例走插件，task合法且协议格式，只破坏④业务校验")
         g2.addWidget(self.combo_destroy_mode, 4, 1, 1, 3)
         left_lay.addWidget(grp2)
 

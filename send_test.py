@@ -12,11 +12,14 @@ case_type 分流：
   normal  - 正常数据：走插件 SendMQ（性能测试）
   error   - 错误数据：走插件 SendMQ（看插件如何处理异常/是否拒绝）
   destroy - 破坏数据：默认【直接写 Redis】(绕过插件，--destroy-via-plugin 可改为走插件)
-            破坏类型 destroy_mode 四类（两个维度组合：核心字段 × task 内容）：
-              type1 - 核心字段乱填 + 业务数据畸形（Excel 行的 fuzz 报文）
-              type2 - 核心字段乱填 + 业务数据正确（取 Excel 第一条 normal 报文）
-              type3 - 核心字段正常 + task 非法 JSON（截断/空/纯文本/二进制垃圾）
-              type4 - 核心字段正常 + task 合法 JSON 但非协议格式（空对象/数组/未知键）
+            破坏类型 destroy_mode 四类（两个维度组合：核心字段 × task 内容），
+            对应中台处理链路的四道关卡：
+              ①来源/路由(核心字段) → ②JSON解析 → ③协议分发(create/query键) → ④业务校验(字段值)
+              type1 - 核心字段乱填 + 业务数据畸形（Excel 行的 fuzz 报文）—— 破坏①+④
+              type2 - 核心字段乱填 + 业务数据正确（取 Excel 第一条 normal 报文）—— 破坏①
+              type3 - 核心字段正常 + task 非法 JSON（截断/空/纯文本/二进制垃圾）—— 破坏②
+              type4 - 核心字段正常 + task 合法 JSON 但非协议格式（空对象/数组/未知键）—— 破坏③
+            （error 用例走插件、task 合法且协议格式，只破坏④业务校验）
             --destroy-mode 选 type1/type2/type3/type4/mixed；mixed=四类轮发；
             空则按 Excel 行级 destroy_mode 列，列缺失/为 mixed 时同样四类轮发
 
@@ -288,14 +291,16 @@ class DataHubClient:
 # 按实测 DataHub_req_stream 的 6 字段格式写入，字段值与插件真实行为一致：
 #   request_id / server_id / server_type / reply_req_stream / reply_reply_stream / task
 # 破坏测试分四类（两个维度组合：核心字段 × task 内容）：
-#   type1 - 核心字段乱填 + 业务数据畸形（Excel 行的 fuzz 报文）
-#   type2 - 核心字段乱填 + 业务数据正确（取 Excel 第一条 normal 报文）
-#   type3 - 核心字段正常 + task 非法 JSON（截断/空/纯文本/控制字符/二进制垃圾）
-#   type4 - 核心字段正常 + task 合法 JSON 但非协议格式（空对象/数组/未知键/错误结构）
+#   中台处理链路：①来源/路由(核心字段) → ②JSON解析 → ③协议分发 → ④业务校验
+#   type1 - 核心字段乱填 + 业务数据畸形（Excel 行的 fuzz 报文）—— 破坏①+④
+#   type2 - 核心字段乱填 + 业务数据正确（取 Excel 第一条 normal 报文）—— 破坏①
+#   type3 - 核心字段正常 + task 非法 JSON —— 破坏②解析层（测解析容错不崩溃）
+#   type4 - 核心字段正常 + task 合法 JSON 但非协议格式 —— 破坏③分发层（测未知结构容错）
+#   （type3/4 核心字段必须正确，坏 task 才能穿透路由到达目标关卡）
 _DESTROY_MODES = ("type1", "type2", "type3", "type4")
 _BADFIELD_MODES = ("type1", "type2")   # 核心字段乱填的两种模式，共用 _TYPE2_TEMPLATES
 
-# type3 模板池：task 为非法 JSON（数据中台解析必然失败，测解析容错）
+# type3 模板池：task 为非法 JSON（破坏②解析层，中台解析必然失败，测解析容错不崩溃）
 _BAD_JSON_TASKS = [
     "",                                     # 空串
     "{",                                    # 截断
@@ -309,7 +314,7 @@ _BAD_JSON_TASKS = [
     "{\r\t\n  ,,, }",                       # 非法语法
 ]
 
-# type4 模板池：task 为合法 JSON 但不是协议格式（测协议分发容错）
+# type4 模板池：task 为合法 JSON 但不是协议格式（破坏③分发层，测未知结构的分发容错）
 _NOT_PROTO_TASKS = [
     "{}",                                   # 空对象
     "[]",                                   # 顶层数组
@@ -377,10 +382,13 @@ _TYPE2_TEMPLATES = [
 def build_destroy_fields(payload, req_id, destroy_mode="type1", server_id="12345"):
     """构造破坏数据的 stream 字段。返回 (fields, tpl_idx)；核心字段正常时 tpl_idx=None。
 
-    type1/type2: 核心字段乱填（_TYPE2_TEMPLATES 按 req_id 稳定哈希取一套），
-                 task 由调用方给定（type1=业务畸形报文，type2=业务正确报文）
-    type3/type4: 核心字段正确（对齐插件真实值），task 已由调用方替换为
-                 非法 JSON / 非协议 JSON 模板（见 _BAD_JSON_TASKS / _NOT_PROTO_TASKS）
+    中台处理链路：①来源/路由(核心字段) → ②JSON解析 → ③协议分发 → ④业务校验
+    type1(破坏①+④): 核心字段乱填（_TYPE2_TEMPLATES 按 req_id 稳定哈希取一套），
+                     task 由调用方给定（业务畸形报文）
+    type2(破坏①):   核心字段乱填，task 由调用方给定（业务正确报文）
+    type3(破坏②):   核心字段正确（对齐插件真实值），task 为非法 JSON 模板
+    type4(破坏③):   核心字段正确，task 为非协议 JSON 模板
+                     （坏 task 见 _BAD_JSON_TASKS / _NOT_PROTO_TASKS，由调用方替换好）
     """
     if destroy_mode in _BADFIELD_MODES:
         # 乱填核心字段：按 req_id 稳定哈希取整套模板，保证可复现
@@ -520,8 +528,10 @@ def main():
                     help="破坏数据也走插件 SendMQ（默认直接写 Redis）")
     ap.add_argument("--destroy-mode", default="",
                     help="破坏测试类型(type1/type2/type3/type4/mixed)："
-                         "type1=核心字段乱填+业务畸形，type2=核心字段乱填+业务正确，"
-                         "type3=核心字段正常+非法JSON，type4=核心字段正常+非协议JSON；"
+                         "type1=乱填字段+业务畸形(破坏路由+业务校验)，"
+                         "type2=乱填字段+业务正确(破坏路由)，"
+                         "type3=正常字段+非法JSON(破坏解析层)，"
+                         "type4=正常字段+非协议JSON(破坏分发层)；"
                          "mixed=四类轮发；空=按 Excel 行级 destroy_mode 列（缺列/mixed 同样四类轮发）")
     ap.add_argument("--destroy-server-id", default="12345",
                     help="type3/type4（核心字段正常）用的 server_id（默认 12345，与 mock 应答一致）")
