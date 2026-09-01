@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QVBoxLayout, QHBoxLayout, QMessageBox,
     QListWidget, QListWidgetItem, QAbstractItemView,
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter, QFileDialog,
+    QTabWidget, QToolButton, QScrollArea, QFrame, QSizePolicy,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -396,6 +397,13 @@ DEFAULT_CONFIG = {
     "destroy_mode": "type1",
     "download": "1",
     "download_dir": "out/performance",
+    "remote": "1",       # 启用远程执行
+    "quiet": "1",        # 安静模式
+    "box_redis": "1",    # 右侧三个标题条的展开状态
+    "box_linux": "1",
+    "box_out": "1",
+    "hsplit": "",        # 上半左右分栏比例（自动记忆）
+    "vsplit": "",        # 上下分栏比例（自动记忆）
 }
 
 # 批量汇总表格列：(表头, summary JSON 里的键)。interface 取顶层字段
@@ -452,12 +460,56 @@ def save_config(cfg):
         pass
 
 
+# ==================== 可折叠分组框 ====================
+class CollapsibleBox(QWidget):
+    """标题条 + 内容：标题样式沿用 QToolBox 页签风格，默认展开，点击可收起"""
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.btn = QToolButton()
+        self.btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn.setArrowType(Qt.ArrowType.DownArrow)
+        self.btn.setText(title)
+        self.btn.setCheckable(True)
+        self.btn.setChecked(True)
+        self.btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        f = QFont("Microsoft YaHei", 9)
+        f.setBold(True)
+        self.btn.setFont(f)
+        # 与 QToolBox::tab 保持一致的视觉：浅蓝底 + 圆角 + 加粗，hover 为选中色
+        self.btn.setStyleSheet(
+            "QToolButton { background: #eef3fb; border: 1px solid #d0d8e4;"
+            " border-radius: 3px; padding: 5px 10px; font-weight: bold;"
+            " text-align: left; }"
+            "QToolButton:hover { background: #cfe0f8; }")
+
+        self.content = QWidget()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(2)
+        lay.addWidget(self.btn)
+        lay.addWidget(self.content)
+        self.btn.clicked.connect(self._on_toggled)
+
+    def _on_toggled(self, checked):
+        self.btn.setArrowType(Qt.ArrowType.DownArrow if checked
+                              else Qt.ArrowType.RightArrow)
+        self.content.setVisible(checked)
+
+    def setExpanded(self, expanded):
+        self.btn.setChecked(expanded)
+        self._on_toggled(expanded)
+
+    def isExpanded(self):
+        return self.btn.isChecked()
+
+
 # ==================== 主窗口 ====================
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("数据中台压力测试工具 (DataHub 压测客户端)")
-        self.resize(1380, 940)
+        self.resize(1380, 900)
         self.worker = None
         self.cfg = load_config()
         self._batch_names = []
@@ -470,37 +522,53 @@ class MainWindow(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 6, 8, 6)
+        root.setSpacing(6)
 
-        # ---- 标题 ----
+        # ---- 顶栏：标题居中 + 下方连接摘要（不展开配置也能确认）----
         title_lbl = QLabel("DataHub 数据中台 · 条件单压测工具")
-        tfont = QFont("Microsoft YaHei", 14)
+        tfont = QFont("Microsoft YaHei", 13)
         tfont.setBold(True)
         title_lbl.setFont(tfont)
         title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(title_lbl)
 
-        # ---- 主体左右分栏：左=配置+日志，右=批量汇总分析 ----
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
+        conn_row = QHBoxLayout()
+        conn_row.setContentsMargins(0, 0, 0, 0)
+        conn_row.addStretch(1)
+        self.lbl_conn = QLabel("")
+        self.lbl_conn.setStyleSheet("color: #666;")
+        self.lbl_conn.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_conn.setToolTip("当前生效的连接配置，可在右侧「连接设置」中修改")
+        conn_row.addWidget(self.lbl_conn)
+        conn_row.addStretch(1)
+        root.addLayout(conn_row)
+
+        # ---- 主体：上=主流程|连接设置，下=日志/汇总（比例可拖拽并自动记忆）----
+        self.vsplit = QSplitter(Qt.Orientation.Vertical)
+        self.vsplit.setChildrenCollapsible(False)
+        self.hsplit = QSplitter(Qt.Orientation.Horizontal)
+        self.hsplit.setChildrenCollapsible(False)
+
+        # ============ 左上：主流程（1 测试数据 -> 2 发送参数 -> 运行）============
         left_w = QWidget()
         left_lay = QVBoxLayout(left_w)
         left_lay.setContentsMargins(0, 0, 0, 0)
-        right_w = QWidget()
-        right_lay = QVBoxLayout(right_w)
-        right_lay.setContentsMargins(0, 0, 0, 0)
 
         # ---- 1. 测试数据（接口复选框平铺）----
         grp1 = QGroupBox("1. 测试数据 (勾选要发送的接口)")
         g1 = QGridLayout(grp1)
         names = list_interfaces()
         self.chk_ifaces = {}     # name -> QCheckBox
-        cols = 3
+        cols = 4
         for i, name in enumerate(names):
             chk = QCheckBox(name)
             chk.setChecked(True)              # 默认全选
             chk.toggled.connect(self.update_interfaces_label)
             self.chk_ifaces[name] = chk
             g1.addWidget(chk, i // cols, i % cols)
+        for c in range(cols):
+            g1.setColumnStretch(c, 1)
 
         # 右侧：已选计数 + 全选/清空/生成
         right = QVBoxLayout()
@@ -519,13 +587,22 @@ class MainWindow(QWidget):
         self.btn_make = QPushButton("批量生成 Excel")
         self.btn_make.clicked.connect(self.on_make)
         right.addWidget(self.btn_make)
-        rows = (len(names) + cols - 1) // cols
+        rows = max((len(names) + cols - 1) // cols, 1)
         g1.addLayout(right, 0, cols, rows, 1)
         left_lay.addWidget(grp1)
 
-        # ---- 2. Redis 配置（写入远程 DataHub.ini 的 [REDIS] 段）----
-        grp_redis = QGroupBox("2. Redis 配置 (保存后插件/mock/统计全部生效)")
-        gr = QGridLayout(grp_redis)
+        # ============ 右上：连接设置（标题条样式不变，内容默认全部展开）============
+        self.box_redis = CollapsibleBox("Redis 配置")
+        self.box_linux = CollapsibleBox("远程 Linux")
+        self.box_out = CollapsibleBox("结果保存")
+        self.box_redis.setExpanded(self.cfg.get("box_redis", "1") == "1")
+        self.box_linux.setExpanded(self.cfg.get("box_linux", "1") == "1")
+        self.box_out.setExpanded(self.cfg.get("box_out", "1") == "1")
+        for b in (self.box_redis, self.box_linux, self.box_out):
+            b.btn.clicked.connect(self._save_ui_config)   # 折叠状态立即记住
+
+        # ---- Redis 配置（写入远程 DataHub.ini 的 [REDIS] 段）----
+        gr = QGridLayout(self.box_redis.content)
         gr.addWidget(QLabel("主机:"), 0, 0)
         self.edit_r_host = QLineEdit(self.cfg.get("r_host", "192.168.1.137"))
         gr.addWidget(self.edit_r_host, 0, 1)
@@ -547,10 +624,9 @@ class MainWindow(QWidget):
         self.btn_save_redis = QPushButton("保存到远程")
         self.btn_save_redis.clicked.connect(self.on_save_redis)
         gr.addWidget(self.btn_save_redis, 1, 4)
-        left_lay.addWidget(grp_redis)
 
-        # ---- 发送参数 ----
-        grp2 = QGroupBox("3. 发送参数")
+        # ---- 2. 发送参数 ----
+        grp2 = QGroupBox("2. 发送参数")
         g2 = QGridLayout(grp2)
         # 输入列自动拉伸，让两列输入框宽度均匀分配
         g2.setColumnStretch(1, 1)
@@ -577,7 +653,7 @@ class MainWindow(QWidget):
         g2.addWidget(self.spin_wait, 1, 1)
 
         self.chk_quiet = QCheckBox("安静模式 (批量压测建议勾选，减少日志)")
-        self.chk_quiet.setChecked(True)
+        self.chk_quiet.setChecked(self.cfg.get("quiet", "1") == "1")
         g2.addWidget(self.chk_quiet, 1, 2, 1, 2)
 
         # 行2：发送模式开关
@@ -618,11 +694,10 @@ class MainWindow(QWidget):
         g2.addWidget(self.combo_destroy_mode, 4, 1, 1, 3)
         left_lay.addWidget(grp2)
 
-        # ---- 远程 Linux ----
-        grp3 = QGroupBox("4. 远程 Linux (发送测试在其上执行)")
-        g3 = QGridLayout(grp3)
-        self.chk_remote = QCheckBox("启用远程执行")
-        self.chk_remote.setChecked(True)
+        # ---- 远程 Linux（发送测试在其上执行）----
+        g3 = QGridLayout(self.box_linux.content)
+        self.chk_remote = QCheckBox("启用远程执行（发送测试在其上执行）")
+        self.chk_remote.setChecked(self.cfg.get("remote", "1") == "1")
         g3.addWidget(self.chk_remote, 0, 0, 1, 4)
 
         g3.addWidget(QLabel("主机:"), 1, 0)
@@ -645,11 +720,9 @@ class MainWindow(QWidget):
         g3.addWidget(QLabel("远程目录:"), 3, 0)
         self.edit_remote_dir = QLineEdit(self.cfg.get("remote_dir", "/home/yangsh/so_test"))
         g3.addWidget(self.edit_remote_dir, 3, 1, 1, 3)
-        left_lay.addWidget(grp3)
 
-        # ---- 结果保存 ----
-        grp4 = QGroupBox("5. 结果保存 (性能统计 Excel/log)")
-        g4 = QGridLayout(grp4)
+        # ---- 结果保存（性能统计 Excel/log）----
+        g4 = QGridLayout(self.box_out.content)
         self.chk_download = QCheckBox("自动下载结果到本地电脑")
         self.chk_download.setChecked(self.cfg.get("download", "1") == "1")
         g4.addWidget(self.chk_download, 0, 0, 1, 4)
@@ -663,47 +736,41 @@ class MainWindow(QWidget):
         self.btn_pick_dir.setToolTip("选择性能统计结果的本地保存目录（会自动记住）")
         self.btn_pick_dir.clicked.connect(self.on_pick_download_dir)
         g4.addWidget(self.btn_pick_dir, 1, 3)
-        left_lay.addWidget(grp4)
 
-        # ---- 6. 批量汇总分析（右侧独立面板，展示全部统计指标）----
-        grp5 = QGroupBox("批量汇总分析 (本次批量各接口统计)")
-        g5 = QVBoxLayout(grp5)
-        top5 = QHBoxLayout()
-        self.lbl_summary_info = QLabel("批量发送完成后自动汇总")
-        self.lbl_summary_info.setStyleSheet("color: #666;")
-        top5.addWidget(self.lbl_summary_info)
-        top5.addStretch(1)
-        self.btn_summary_refresh = QPushButton("刷新汇总")
-        self.btn_summary_refresh.clicked.connect(self._refresh_summary)
-        top5.addWidget(self.btn_summary_refresh)
-        self.btn_summary_export = QPushButton("导出 Excel")
-        self.btn_summary_export.clicked.connect(self.on_export_summary)
-        top5.addWidget(self.btn_summary_export)
-        self.btn_summary_clear = QPushButton("清空")
-        self.btn_summary_clear.clicked.connect(self.on_clear_summary)
-        top5.addWidget(self.btn_summary_clear)
-        g5.addLayout(top5)
-        self.table_summary = QTableWidget(0, len(SUMMARY_COLS))
-        self.table_summary.setHorizontalHeaderLabels([c[0] for c in SUMMARY_COLS])
-        self.table_summary.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table_summary.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table_summary.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table_summary.verticalHeader().setVisible(False)
-        # 列多：接口列拉伸，其余可横向滚动查看
-        hdr = self.table_summary.horizontalHeader()
-        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hdr.setDefaultSectionSize(92)
-        hdr.setMinimumSectionSize(60)
-        self.table_summary.setStyleSheet(
-            "QTableWidget { background: #fafafa; border: 1px solid #ddd; border-radius: 4px; }"
-            "QHeaderView::section { background: #e8f0fe; font-weight: bold;"
-            " border: none; border-right: 1px solid #d0d0d0; padding: 4px; }"
-            "QTableWidget::item { padding: 2px 6px; }")
-        g5.addWidget(self.table_summary)
-        right_lay.addWidget(grp5)
+        # ---- 上半组装：左=主流程，右=连接设置 + 使用提示（可滚动，窗口矮也不挤）----
+        right_w = QScrollArea()
+        right_w.setWidgetResizable(True)
+        right_w.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        right_lay = QVBoxLayout(inner)
+        right_lay.setContentsMargins(0, 0, 4, 0)
+        right_lay.addWidget(self.box_redis)
+        right_lay.addWidget(self.box_linux)
+        right_lay.addWidget(self.box_out)
 
-        # ---- 操作按钮 ----
+        tip = QGroupBox("使用提示")
+        tlay = QVBoxLayout(tip)
+        tip_text = QLabel(
+            "· 不勾选「启用远程执行」时只在本机生成报文，"
+            "真实发送需要远程 Linux（.so 在 Linux 上）<br>"
+            "· Redis / 远程 Linux 改完自动生效并记住，无需另外保存<br>"
+            "· 标题栏可点击收起，分栏比例可拖拽，下次启动保持"
+        )
+        tip_text.setWordWrap(True)
+        tip_text.setTextFormat(Qt.TextFormat.RichText)
+        tip_text.setStyleSheet("color: #555;")
+        tip_text.setAlignment(Qt.AlignmentFlag.AlignTop)
+        tlay.addWidget(tip_text)
+        right_lay.addWidget(tip)
+        right_lay.addStretch(1)
+        right_w.setWidget(inner)
+
+        self.hsplit.addWidget(left_w)
+        self.hsplit.addWidget(right_w)
+        self.hsplit.setStretchFactor(0, 3)
+        self.hsplit.setStretchFactor(1, 2)
+
+        # ---- 操作按钮（紧跟主流程）----
         btns = QHBoxLayout()
         self.btn_send = QPushButton("运行发送测试")
         self.btn_send.clicked.connect(self.on_send)
@@ -720,25 +787,107 @@ class MainWindow(QWidget):
         btns.addWidget(self.btn_upload_all)
         btns.addStretch(1)
         left_lay.addLayout(btns)
+        left_lay.addStretch(1)
 
-        # ---- 日志区 ----
+        # ========== 下半：日志 / 汇总（全宽，汇总表 19 列不再需要横向滚动）==========
+        self.tabs = QTabWidget()
+
+        # ---- 页1：运行日志 ----
+        self.tab_log = QWidget()
+        tl = QVBoxLayout(self.tab_log)
+        tl.setContentsMargins(4, 4, 4, 4)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         # 文档最大块数：Qt 内部高效丢弃最旧行，防止日志过多导致渲染卡死
         self.log.document().setMaximumBlockCount(MAX_LOG_LINES)
         font = QFont("Consolas", 9)
         self.log.setFont(font)
-        left_lay.addWidget(self.log, 1)
+        tl.addWidget(self.log)
+        self.tabs.addTab(self.tab_log, "运行日志")
 
-        # ---- 组装左右分栏 ----
-        splitter.addWidget(left_w)
-        splitter.addWidget(right_w)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([760, 560])
-        root.addWidget(splitter)
+        # ---- 页2：批量汇总分析 ----
+        self.tab_summary = QWidget()
+        ts = QVBoxLayout(self.tab_summary)
+        ts.setContentsMargins(4, 6, 4, 4)
+        top5 = QHBoxLayout()
+        self.lbl_summary_info = QLabel("批量发送完成后自动汇总")
+        self.lbl_summary_info.setStyleSheet("color: #666;")
+        top5.addWidget(self.lbl_summary_info)
+        top5.addStretch(1)
+        self.btn_summary_refresh = QPushButton("刷新汇总")
+        self.btn_summary_refresh.clicked.connect(self._refresh_summary)
+        top5.addWidget(self.btn_summary_refresh)
+        self.btn_summary_export = QPushButton("导出 Excel")
+        self.btn_summary_export.clicked.connect(self.on_export_summary)
+        top5.addWidget(self.btn_summary_export)
+        self.btn_summary_clear = QPushButton("清空")
+        self.btn_summary_clear.clicked.connect(self.on_clear_summary)
+        top5.addWidget(self.btn_summary_clear)
+        ts.addLayout(top5)
+        self.table_summary = QTableWidget(0, len(SUMMARY_COLS))
+        self.table_summary.setHorizontalHeaderLabels([c[0] for c in SUMMARY_COLS])
+        self.table_summary.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_summary.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_summary.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_summary.verticalHeader().setVisible(False)
+        # 全宽后 19 列基本一屏可见：接口列拉伸，其余固定宽，仍超出时才横向滚动
+        hdr = self.table_summary.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setDefaultSectionSize(84)
+        hdr.setMinimumSectionSize(60)
+        hdr.resizeSection(0, 130)
+        self.table_summary.setStyleSheet(
+            "QTableWidget { background: #fafafa; border: 1px solid #ddd; border-radius: 4px; }"
+            "QHeaderView::section { background: #e8f0fe; font-weight: bold;"
+            " border: none; border-right: 1px solid #d0d0d0; padding: 4px; }"
+            "QTableWidget::item { padding: 2px 6px; }")
+        ts.addWidget(self.table_summary, 1)
+        self.tabs.addTab(self.tab_summary, "批量汇总分析")
 
+        # ---- 上下组装 ----
+        self.vsplit.addWidget(self.hsplit)
+        self.vsplit.addWidget(self.tabs)
+        self.vsplit.setStretchFactor(0, 0)
+        self.vsplit.setStretchFactor(1, 1)
+        root.addWidget(self.vsplit, 1)
+
+        # ---- 顶栏连接摘要随配置实时刷新 ----
+        for w in (self.edit_r_host, self.edit_r_port, self.edit_host,
+                  self.edit_user, self.edit_remote_dir):
+            w.textChanged.connect(self._update_conn_summary)
+        for sp in (self.spin_r_db, self.spin_ssh_port):
+            sp.valueChanged.connect(self._update_conn_summary)
+        self.chk_remote.toggled.connect(self._update_conn_summary)
+
+        self._restore_splitter("hsplit", self.hsplit, [880, 500])
+        self._restore_splitter("vsplit", self.vsplit, [480, 362])
         self.update_excel_label()
+        self._update_conn_summary()
+
+    # ---------- 布局辅助 ----------
+    def _update_conn_summary(self):
+        """顶栏摘要：不用展开“连接设置”也能确认当前连的是哪台机器"""
+        r = (f"{self.edit_r_host.text().strip()}:{self.edit_r_port.text().strip()}"
+             f"/{self.spin_r_db.value()}")
+        if self.chk_remote.isChecked():
+            exe = (f"{self.edit_user.text().strip()}@"
+                   f"{self.edit_host.text().strip()}:{self.spin_ssh_port.value()}")
+        else:
+            exe = "本地执行"
+        self.lbl_conn.setText(f"Redis {r}    |    执行 {exe}")
+
+    def _restore_splitter(self, key, splitter, default):
+        """恢复上次的分割比例；配置无效则用默认值"""
+        raw = self.cfg.get(key, "")
+        try:
+            sizes = [int(x) for x in raw.split(",") if x.strip()]
+            if len(sizes) == len(default) and all(s > 0 for s in sizes):
+                splitter.setSizes(sizes)
+                return
+        except Exception:
+            pass
+        splitter.setSizes(list(default))
 
     # ---------- 工具 ----------
     def selected_interfaces(self):
@@ -1055,20 +1204,10 @@ class MainWindow(QWidget):
             parts.append(dm)
         return " ".join(parts)
 
-    def remote_upload_files(self, name):
-        """需要上传到远程的文件列表：脚本 + 公共模块 + 接口定义 + 数据文件"""
-        rd = self.edit_remote_dir.text().strip()
-        return [
-            (os.path.join(BASE_DIR, "send_test.py"), f"{rd}/send_test.py"),
-            (os.path.join(BASE_DIR, "mock_datahub.py"), f"{rd}/mock_datahub.py"),
-            (os.path.join(INTERFACES_DIR, "_common.py"), f"{rd}/interfaces/_common.py"),
-            (os.path.join(INTERFACES_DIR, f"{name}.py"), f"{rd}/interfaces/{name}.py"),
-            (os.path.join(DATA_DIR, f"{name}.xlsx"), f"{rd}/data/{name}.xlsx"),
-        ]
-
     def _save_ui_config(self):
-        """把当前界面上的配置保存到 config.ini"""
-        cfg = {
+        """把当前界面上的配置保存到 config.ini（基于已有配置增量更新，避免覆盖 Redis 等项）"""
+        cfg = load_config()
+        cfg.update({
             "host": self.edit_host.text().strip(),
             "port": str(self.spin_ssh_port.value()),
             "username": self.edit_user.text().strip(),
@@ -1078,11 +1217,21 @@ class MainWindow(QWidget):
             "max": str(self.spin_max.value()),
             "wait": str(self.spin_wait.value()),
             "mock": "1" if self.chk_mock.isChecked() else "0",
+            "quiet": "1" if self.chk_quiet.isChecked() else "0",
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
             "destroy_mode": self.combo_destroy_mode.currentData() or "type1",
+            "remote": "1" if self.chk_remote.isChecked() else "0",
             "download": "1" if self.chk_download.isChecked() else "0",
+            "box_redis": "1" if self.box_redis.isExpanded() else "0",
+            "box_linux": "1" if self.box_linux.isExpanded() else "0",
+            "box_out": "1" if self.box_out.isExpanded() else "0",
             "download_dir": self.edit_download_dir.text().strip() or DEFAULT_CONFIG["download_dir"],
-        }
+        })
+        # 分栏比例（界面已构建时才存在）
+        if hasattr(self, "hsplit"):
+            cfg["hsplit"] = ",".join(str(x) for x in self.hsplit.sizes())
+        if hasattr(self, "vsplit"):
+            cfg["vsplit"] = ",".join(str(x) for x in self.vsplit.sizes())
         save_config(cfg)
 
     def on_read_redis(self):
@@ -1197,6 +1346,7 @@ class MainWindow(QWidget):
             "远程目录": self.edit_remote_dir.text().strip(),
         }
         self.set_running(True)
+        self.tabs.setCurrentWidget(self.tab_log)      # 运行中看实时日志
         if len(names) > 1:
             self.append_log(f"\n[BATCH] 共 {len(names)} 个接口待发送: {', '.join(names)}")
         self._run_next_batch_item()
@@ -1233,6 +1383,7 @@ class MainWindow(QWidget):
         if idx >= len(names):
             self.append_log(f"[BATCH] 全部完成（共 {len(names)} 个接口）")
             self._auto_export = True
+            self.tabs.setCurrentWidget(self.tab_summary)   # 跑完直接看汇总
             self._refresh_summary()   # 汇总分析始终刷新（stats JSON 始终下载）
             self.set_running(False)
             return
