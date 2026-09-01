@@ -12,6 +12,13 @@ case_type 分流：
   normal  - 正常数据：走插件 SendMQ（性能测试）
   error   - 错误数据：走插件 SendMQ（看插件如何处理异常/是否拒绝）
   destroy - 破坏数据：默认【直接写 Redis】(绕过插件，--destroy-via-plugin 可改为走插件)
+            破坏类型 destroy_mode 四类（两个维度组合：核心字段 × task 内容）：
+              type1 - 核心字段乱填 + 业务数据畸形（Excel 行的 fuzz 报文）
+              type2 - 核心字段乱填 + 业务数据正确（取 Excel 第一条 normal 报文）
+              type3 - 核心字段正常 + task 非法 JSON（截断/空/纯文本/二进制垃圾）
+              type4 - 核心字段正常 + task 合法 JSON 但非协议格式（空对象/数组/未知键）
+            --destroy-mode 选 type1/type2/type3/type4/mixed；mixed=四类轮发；
+            空则按 Excel 行级 destroy_mode 列，列缺失/为 mixed 时同样四类轮发
 
 用法：
   python send_test.py --interface query            # 发送 data/query.xlsx
@@ -280,10 +287,45 @@ class DataHubClient:
 # ==================== 破坏测试：直接写 Redis ====================
 # 按实测 DataHub_req_stream 的 6 字段格式写入，字段值与插件真实行为一致：
 #   request_id / server_id / server_type / reply_req_stream / reply_reply_stream / task
-# 破坏测试分两类：
-#   type1 - 核心字段正确，task 乱写（测数据中台对畸形业务数据的处理）
-#   type2 - 核心字段乱填（测数据中台对异常来源消息的处理）
-# type2 固定模板轮换（按 req_id 稳定哈希取模，保证可复现）：
+# 破坏测试分四类（两个维度组合：核心字段 × task 内容）：
+#   type1 - 核心字段乱填 + 业务数据畸形（Excel 行的 fuzz 报文）
+#   type2 - 核心字段乱填 + 业务数据正确（取 Excel 第一条 normal 报文）
+#   type3 - 核心字段正常 + task 非法 JSON（截断/空/纯文本/控制字符/二进制垃圾）
+#   type4 - 核心字段正常 + task 合法 JSON 但非协议格式（空对象/数组/未知键/错误结构）
+_DESTROY_MODES = ("type1", "type2", "type3", "type4")
+_BADFIELD_MODES = ("type1", "type2")   # 核心字段乱填的两种模式，共用 _TYPE2_TEMPLATES
+
+# type3 模板池：task 为非法 JSON（数据中台解析必然失败，测解析容错）
+_BAD_JSON_TASKS = [
+    "",                                     # 空串
+    "{",                                    # 截断
+    '{"create": ',                          # 键后截断
+    '{"create": {"Account": {"FAccount"',   # 深处截断
+    "not a json at all",                    # 纯文本
+    "{{{{{{{{",                             # 括号垃圾
+    '{"create": "\x00\x01\x02"}',           # 控制字符
+    "abc\x00\x01\x02\xff\xfe",              # 二进制垃圾
+    "\ufeff{\"create\":{}}",                # BOM 前缀（多数解析器直接失败）
+    "{\r\t\n  ,,, }",                       # 非法语法
+]
+
+# type4 模板池：task 为合法 JSON 但不是协议格式（测协议分发容错）
+_NOT_PROTO_TASKS = [
+    "{}",                                   # 空对象
+    "[]",                                   # 顶层数组
+    "null",                                 # 顶层 null
+    "true",                                 # 顶层布尔
+    "12345",                                # 顶层数字
+    '"just a string"',                      # 顶层字符串
+    '{"foo": "bar"}',                       # 未知顶层键
+    '{"MsgType": 4}',                       # 只有内部协议键，缺业务体
+    '{"create": "i am a string"}',          # create 不是对象
+    '{"create": []}',                       # create 是数组
+    '{"query": {"unknown_field": 1}}',      # 已知键但业务体字段未知
+    '{"a": {"b": {"c": {"d": [1, 2, 3]}}}}',  # 深嵌套未知结构
+]
+
+# 核心字段乱填模板（type1/type2 共用，按 req_id 稳定哈希取模，保证可复现）：
 #   {req_id} 会被替换为实际用例编号。每套组合覆盖一类破坏：
 #   0 特殊符号+超大数字 / 1 类型错误 / 2 超长溢出 / 3 空值空白 / 4 控制字符 / 5 混合乱填
 _TYPE2_TEMPLATES = [
@@ -333,9 +375,15 @@ _TYPE2_TEMPLATES = [
 
 
 def build_destroy_fields(payload, req_id, destroy_mode="type1", server_id="12345"):
-    """构造破坏数据的 stream 字段。返回 (fields, tpl_idx)；type1 时 tpl_idx=None。"""
-    if destroy_mode == "type2":
-        # 类2：核心字段乱填。按 req_id 稳定哈希取整套模板，保证可复现
+    """构造破坏数据的 stream 字段。返回 (fields, tpl_idx)；核心字段正常时 tpl_idx=None。
+
+    type1/type2: 核心字段乱填（_TYPE2_TEMPLATES 按 req_id 稳定哈希取一套），
+                 task 由调用方给定（type1=业务畸形报文，type2=业务正确报文）
+    type3/type4: 核心字段正确（对齐插件真实值），task 已由调用方替换为
+                 非法 JSON / 非协议 JSON 模板（见 _BAD_JSON_TASKS / _NOT_PROTO_TASKS）
+    """
+    if destroy_mode in _BADFIELD_MODES:
+        # 乱填核心字段：按 req_id 稳定哈希取整套模板，保证可复现
         idx = sum(ord(ch) for ch in str(req_id)) % len(_TYPE2_TEMPLATES)
         tpl = _TYPE2_TEMPLATES[idx]
         fields = {
@@ -343,8 +391,8 @@ def build_destroy_fields(payload, req_id, destroy_mode="type1", server_id="12345
             for k, v in tpl.items()
         }
         fields["task"] = payload
-    else:
-        # 类1：核心字段正确（对齐插件真实值），task 乱写
+    elif destroy_mode in _DESTROY_MODES:
+        # type3/type4：核心字段正确，task 为坏 JSON 模板（调用方已替换好）
         idx = None
         fields = {
             "request_id": str(req_id),
@@ -352,8 +400,10 @@ def build_destroy_fields(payload, req_id, destroy_mode="type1", server_id="12345
             "server_type": "WT",
             "reply_req_stream": f"WT-{server_id}",
             "reply_reply_stream": f"WT-{server_id}-reply",
-            "task": payload,   # 畸形 JSON / 超长 / 特殊字符
+            "task": payload,
         }
+    else:
+        raise ValueError(f"未知破坏类型: {destroy_mode}，可用: {_DESTROY_MODES}")
     return fields, idx
 
 
@@ -469,9 +519,12 @@ def main():
     ap.add_argument("--destroy-via-plugin", action="store_true",
                     help="破坏数据也走插件 SendMQ（默认直接写 Redis）")
     ap.add_argument("--destroy-mode", default="",
-                    help="破坏测试类型(type1/type2/mixed)，mixed=交替；空=按 Excel 行级 destroy_mode 列，默认 type1")
+                    help="破坏测试类型(type1/type2/type3/type4/mixed)："
+                         "type1=核心字段乱填+业务畸形，type2=核心字段乱填+业务正确，"
+                         "type3=核心字段正常+非法JSON，type4=核心字段正常+非协议JSON；"
+                         "mixed=四类轮发；空=按 Excel 行级 destroy_mode 列（缺列/mixed 同样四类轮发）")
     ap.add_argument("--destroy-server-id", default="12345",
-                    help="type1 用的 server_id（默认 12345，与 mock 应答一致）")
+                    help="type3/type4（核心字段正常）用的 server_id（默认 12345，与 mock 应答一致）")
     ap.add_argument("--no-stats", dest="stats", action="store_false", default=True,
                     help="关闭性能统计(默认开)")
     ap.add_argument("--stats-out", default="",
@@ -594,6 +647,10 @@ def main():
             else:
                 plugin_cases.append((c, p))
 
+        # type2 需要"业务正确"的 task：优先取 Excel 第一条 normal 用例的报文
+        good_payload = next((p for c, p in zip(cases, payloads)
+                             if c["_type"] == "normal"), None)
+
         # 标记发送阶段开始（真实吞吐统计用）
         if stats:
             stats.mark_send_start()
@@ -617,23 +674,41 @@ def main():
             print(f"\n[RESULT] 插件发送成功 {ok}/{len(plugin_cases)}，耗时 {dt:.3f}s，"
                   f"平均 {len(plugin_cases) / dt:.0f} 条/s")
 
-        # 2) 破坏测试：直写 Redis（分 type1/type2 两类）
+        # 2) 破坏测试：直写 Redis（type1~type4 四类）
         if destroy_cases:
-            # --destroy-mode: type1/type2/mixed；空=按 Excel 行级 destroy_mode 列，默认 type1
-            # mixed = 按顺序交替 type1/type2
-            if args.destroy_mode == "mixed":
-                mode_func = lambda c, i: ("type1" if i % 2 == 0 else "type2")
-            elif args.destroy_mode:
-                mode_func = lambda c, i: args.destroy_mode
-            else:
-                mode_func = lambda c, i: (c.get("destroy_mode") or "type1")
-            cnt1 = sum(1 for i, (c, _) in enumerate(destroy_cases) if mode_func(c, i) == "type2")
-            cnt2 = len(destroy_cases) - cnt1
-            print(f"\n[DESTROY] 破坏测试共 {len(destroy_cases)} 条"
-                  f"（type1 核心字段正常/业务数据畸形: {cnt2}，"
-                  f"type2 核心字段乱填: {cnt1}），直写 Redis...")
-            items = [(p, c["_no"], mode_func(c, i), args.destroy_server_id)
-                     for i, (c, p) in enumerate(destroy_cases)]
+            # --destroy-mode: type1/type2/type3/type4/mixed；空=按 Excel 行级 destroy_mode 列
+            # 行级列缺失或为 mixed 时，同样四类轮发（type1→type2→type3→type4→type1...）
+            def resolve_mode(c, i):
+                m = str(args.destroy_mode or c.get("destroy_mode") or "").strip().lower()
+                if not m or m == "mixed":
+                    return _DESTROY_MODES[i % len(_DESTROY_MODES)]
+                if m not in _DESTROY_MODES:
+                    sys.exit(f"[FAIL] 未知破坏类型 {m}，可用: {_DESTROY_MODES + ('mixed',)}")
+                return m
+
+            # type2 需要业务正确的报文
+            if good_payload is None:
+                print("[WARN] Excel 无 normal 用例，type2 将退用 destroy 行自身报文（内容可能仍畸形）")
+                good_payload = payloads[0] if payloads else "{}"
+            # type3/type4 的 task 与 Excel 行无关，直接从模板池轮换取
+            mode_count = dict.fromkeys(_DESTROY_MODES, 0)
+            bj_idx = np_idx = 0
+            items = []
+            for i, (c, p) in enumerate(destroy_cases):
+                mode = resolve_mode(c, i)
+                task = p
+                if mode == "type2":
+                    task = good_payload
+                elif mode == "type3":
+                    task = _BAD_JSON_TASKS[bj_idx % len(_BAD_JSON_TASKS)]
+                    bj_idx += 1
+                elif mode == "type4":
+                    task = _NOT_PROTO_TASKS[np_idx % len(_NOT_PROTO_TASKS)]
+                    np_idx += 1
+                mode_count[mode] += 1
+                items.append((task, c["_no"], mode, args.destroy_server_id))
+            dist = "，".join(f"{m}: {mode_count[m]}" for m in _DESTROY_MODES)
+            print(f"\n[DESTROY] 破坏测试共 {len(destroy_cases)} 条（{dist}），直写 Redis...")
             ok, dt, via = destroy_write_all(items, stats,
                                             concurrency=max(2, min(args.workers, 8)))
             failed = len(destroy_cases) - ok
