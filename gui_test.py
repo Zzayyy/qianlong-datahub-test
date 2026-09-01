@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QCheckBox, QLineEdit, QTextEdit, QGroupBox,
     QGridLayout, QVBoxLayout, QHBoxLayout, QMessageBox,
     QListWidget, QListWidgetItem, QAbstractItemView,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
+    QTableWidget, QTableWidgetItem, QHeaderView, QSplitter, QFileDialog,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -658,7 +658,11 @@ class MainWindow(QWidget):
         if not os.path.isabs(_dl_dir):
             _dl_dir = os.path.join(BASE_DIR, _dl_dir)
         self.edit_download_dir = QLineEdit(_dl_dir)
-        g4.addWidget(self.edit_download_dir, 1, 1, 1, 3)
+        g4.addWidget(self.edit_download_dir, 1, 1, 1, 2)
+        self.btn_pick_dir = QPushButton("选择目录…")
+        self.btn_pick_dir.setToolTip("选择性能统计结果的本地保存目录（会自动记住）")
+        self.btn_pick_dir.clicked.connect(self.on_pick_download_dir)
+        g4.addWidget(self.btn_pick_dir, 1, 3)
         left_lay.addWidget(grp4)
 
         # ---- 6. 批量汇总分析（右侧独立面板，展示全部统计指标）----
@@ -763,6 +767,33 @@ class MainWindow(QWidget):
         if not os.path.isabs(d):
             d = os.path.join(BASE_DIR, d)
         return d
+
+    def on_pick_download_dir(self):
+        """弹窗选择本地结果目录（不存在时询问是否创建），选择后立即记住"""
+        cur = self._download_dir_abs()
+        start = cur if os.path.isdir(cur) else BASE_DIR
+        d = QFileDialog.getExistingDirectory(
+            self, "选择结果保存目录", start,
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks)
+        if not d:
+            return
+        d = os.path.normpath(d)
+        if not os.path.isdir(d):
+            if QMessageBox.question(
+                    self, "目录不存在", f"目录不存在，是否创建？\n{d}",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception as e:
+                QMessageBox.warning(self, "提示", f"创建目录失败: {e}")
+                return
+        self.edit_download_dir.setText(d)
+        cfg = load_config()
+        cfg["download_dir"] = d
+        save_config(cfg)
+        self.append_log(f"[配置] 结果保存目录已设为 {d}")
 
     def _safe_float(self, v):
         try:
@@ -975,7 +1006,7 @@ class MainWindow(QWidget):
         if hasattr(self, "btn_read_redis"):
             self.btn_read_redis.setEnabled(not running)
             self.btn_save_redis.setEnabled(not running)
-        for b in ("btn_summary_refresh", "btn_summary_export"):
+        for b in ("btn_pick_dir", "btn_summary_refresh", "btn_summary_export"):
             if hasattr(self, b):
                 getattr(self, b).setEnabled(not running)
 
