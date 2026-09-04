@@ -9,7 +9,11 @@
     -> 插件内部异步经 Redis 送数据中台，回复走回调返回
 
 case_type 分流：
-  normal  - 正常数据：走插件 SendMQ（性能测试）
+  normal  - 压测数据：走插件 SendMQ（性能测试）。账号四要素与真实账号完全匹配、
+            字段完整合法，走完整业务主链路，统计结果才有意义。
+  probe   - 兼容性探测：走插件 SendMQ，但结果不确定（缺字段/属性不匹配/边界取值），
+            可能走错误路径或返回空，因此【不计入压测指标】，只用于功能确认。
+            跑性能统计请用 --type normal 把 probe 排除掉。
   error   - 错误数据：走插件 SendMQ（看插件如何处理异常/是否拒绝）
   destroy - 破坏数据：默认【直接写 Redis】(绕过插件，--destroy-via-plugin 可改为走插件)
             破坏类型 destroy_mode 四类（两个维度组合：核心字段 × task 内容），
@@ -518,7 +522,8 @@ def main():
     ap.add_argument("--workers", type=int, default=4, help="并发线程数")
     ap.add_argument("--max", type=int, default=0, help="最多处理多少条(0=全部)")
     ap.add_argument("--type", default="",
-                    help="只发指定用例类型，逗号分隔，如 normal,error,destroy（空=全部）")
+                    help="只发指定用例类型，逗号分隔，如 normal,error,destroy,probe"
+                         "（空=全部；压测建议只传 normal）")
     ap.add_argument("--wait", type=float, default=3.0, help="发完后等待回复秒数")
     ap.add_argument("--reply", type=int, default=0, choices=[0, 1], help="reply_flag")
     ap.add_argument("--init-wait", type=float, default=5.0, help="等待插件 inited 最大秒数(兜底超时，正常2-3s即探测到)")
@@ -571,7 +576,8 @@ def main():
         allowed = {t.strip().lower() for t in args.type.split(",") if t.strip()}
         cases = [c for c in cases if c["_type"] in allowed]
         if not cases:
-            sys.exit(f"[FAIL] 类型 {args.type} 过滤后无用例。可用类型: normal/error/destroy")
+            sys.exit(f"[FAIL] 类型 {args.type} 过滤后无用例。"
+                     f"可用类型: normal/probe/error/destroy")
     # --max 循环：过滤后再循环到 N 条（压测需要）
     if args.max > len(cases):
         base = cases[:]
@@ -587,7 +593,13 @@ def main():
         cases = cases[:args.max]
     print(f"[INFO] 接口={mod.NAME} 从 {excel} 读取 {len(cases)} 条用例")
     from collections import Counter
-    print(f"[INFO] 类型分布: {dict(Counter(c['_type'] for c in cases))}\n")
+    _dist = Counter(c["_type"] for c in cases)
+    print(f"[INFO] 类型分布: {dict(_dist)}")
+    if "probe" in _dist:
+        print("[WARN] 本次含 probe 用例（兼容性探测，结果不确定），"
+              "其耗时/成功率不计入性能指标；压测请加 --type normal\n")
+    else:
+        print()
 
     # 构造报文（按接口 + 行）
     payloads = []

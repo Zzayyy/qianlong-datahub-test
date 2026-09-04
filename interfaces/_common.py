@@ -73,11 +73,11 @@ TOKEN_MAP.update({
     "__PRICE_INF__": "inf",
     "__PRICE_NEGINF__": "-inf",
     "__PRICE_STR__": "abc",
-    # Refs 数组畸形
-    "__REFS_MANY__": ",".join([f"26319{i:04d}" for i in range(500)]),
-    "__REFS_DUP__": "26319550,26319550,26319550,26319550",
-    "__REFS_SPACE__": " 26319550 , 26319551 , 26319552 ",
-    "__REFS_SQL__": "26319550'; DROP TABLE x;--",
+    # Refs 数组畸形（基于真实 Ref 变形）
+    "__REFS_MANY__": ",".join([f"2026052800{i:04d}" for i in range(500)]),
+    "__REFS_DUP__": "20260528000010,20260528000010,20260528000010,20260528000010",
+    "__REFS_SPACE__": " 20260528000010 , 20260604000001 ",
+    "__REFS_SQL__": "20260528000010'; DROP TABLE x;--",
     "__REFS_EMOJI__": "\U0001F600" * 20,
 })
 
@@ -165,7 +165,113 @@ def apply_dotted(row, payload_root, top_key, skip_keys=()):
 
 # ==================== 批量数据生成（让多线程压测更有意义）====================
 
-# 多账号池：覆盖资金/客户号、股票/期权、真实与虚拟账号，用于制造并发负载
+# ==================== 线上真实数据（与 acc_sign.py / query.py 保持一致）====================
+# 来源：192.168.1.137 Redis DataHub_req_stream 真实签署报文 + 请求接口doc.txt 真实 create 样本
+REAL_ACCOUNT = {
+    "Model": 0,                  # 0：内嵌模式
+    "AccountType": 7,            # 7：客户号
+    "AccAtt": 6,                 # 6：期权
+    "FAccount": "010100011300",  # 云单账号
+}
+
+# 签署主体信息（与 Account 配套的密码/营业部/姓名/交易账号）
+REAL_SIGN = {
+    "TradePwd": "123123",
+    "BranchNO": "123456",
+    "ClientName": "张国昌",
+    "TradeAccount": "010100011300",
+}
+
+# 股东号：[ (SAccount, ExchangeNum), ... ]  1=上海 2=深圳
+REAL_SHAREHOLDERS = [("A442523077", 1), ("0199908393", 2)]
+
+# 云单引用：doc 真实样本中出现过的 Ref（create 返回 20260528000010 / remove 使用 20260604000001）
+# 注意：Ref 必须是该账号下真实存在的云单，若中台返回"不存在"，用 query 结果回填即可。
+REAL_REFS = ["20260528000010", "20260604000001"]
+# 不存在的引用（错误用例专用，格式与真实 Ref 一致）
+FAKE_REF = "20991231000000"
+
+# 真实委托/条件/下单设置：请求接口doc.txt 1.(1) 委托服务器 -> 数据中台 的 create 样本
+REAL_ENTRUST = {
+    "ContractCode": "90007939",   # 合约代码
+    "ExchangeNum": 2,             # 市场 2=深圳
+    "EntrustPrice": "0.7434",     # 委托价格
+    "MarketOrderType": 15,        # 委托方式 15=超价
+    "CoveredType": False,         # 非备兑
+    "BSType": 1,                  # 买
+    "OCType": 1,                  # 开仓
+    "PriceUnit": "0.0001",        # 价格最小变动单位
+    "EntrustAmount": 20,          # 委托数量
+}
+REAL_CFG_EXCEED = {
+    "ExchangeNum": 2,
+    "StockCode": "90007939",      # 标的代码
+    "StockName": "50ETF",         # 标的名称
+    "PriceStepBuy": -1,           # 买入滑点
+    "PriceStepSell": 1,           # 卖出滑点
+    "PriceType": 0,               # 基准价类型 0=限价
+    "PriceUnit": "0.0001",
+    "Decimals": 4,
+}
+REAL_CFG_AUTO_WITHDRAW = {"WithdrawSec": 10}
+REAL_CFG_FIXED_SPLIT = {"LimitBase": 50, "LimitStep": 50, "LimitInterval": 300,
+                        "MarketBase": 10, "MarketStep": 10, "MarketInterval": 300}
+REAL_CFG_RAND_SPLIT = {"LimitBase": 1, "LimitMin": 1, "LimitMax": 5, "LimitInterval": 300,
+                       "MarketBase": 1, "MarketMin": 1, "MarketMax": 5, "MarketInterval": 300}
+REAL_CFG_APPEND = {"MarketOrderType": 15, "Tick": 2, "IntervalSec": 300,
+                   "Repeat": 2, "EndWithdraw": False}
+REAL_COND_PRICE = {"ContractCode": "90007939", "ExchangeNum": 2,
+                   "Op": ">", "TriggerPrice": "0.234"}
+REAL_COND_PERCENT = {"ContractCode": "90007939", "ExchangeNum": 2,
+                     "Op": ">", "TriggerPercent": "5.25"}
+# 定时条件：日期取当前之后（doc 样本 20260813 已过期）
+REAL_COND_TIME = {"ContractCode": "90007939", "ExchangeNum": 2,
+                  "TriggerDate": "20260910", "TriggerTime": "135100"}
+# 按合约止盈止损（doc 样本合约 10011743，沪市）
+REAL_COND_LOSS = {"ContractCode": "10011743", "ExchangeNum": 1,
+                  "Method": 1, "ValueType": 1, "Value": "0.0675"}
+REAL_COND_PROFIT = {"ContractCode": "10011743", "ExchangeNum": 1, "Method": 1,
+                    "ValueType": 1, "Value": "0.0675", "WithdrawType": 2, "Withdraw": "0.50"}
+# 按标的止盈止损（doc 样本标的 510050，沪市）
+REAL_COND_TARGET_LOSS = {"StockCode": "510050", "ExchangeNum": 1,
+                         "Method": 1, "ValueType": 1, "Value": "3.216"}
+REAL_COND_TARGET_PROFIT = {"StockCode": "510050", "ExchangeNum": 1, "Method": 1,
+                           "ValueType": 1, "Value": "3.216", "WithdrawType": 2,
+                           "Withdraw": "0.50"}
+REAL_VALID_DATE = "2026-12-31"   # 云单到期日期（doc 样本 2026-08-31 已过期，顺延到年末）
+
+# ==================== 账号池：按用途严格分成两个，禁止混用 ====================
+# 用例类型约定（四个，各司其职）：
+#   normal  - 压测数据：账号四要素必须与真实账号完全匹配，业务字段完整合法。
+#             走完整业务主链路，其统计结果（吞吐/响应时间/字节数）才有意义。
+#   probe   - 兼容性探测：验证"某字段是否必填/某取值是否接受"（如省略 Model、
+#             Model=1、渠道或账号类型错配、FAccount 带空格）。结果不确定，
+#             可能走错误路径或返回空，因此【不计入压测指标】，只用于功能确认。
+#   error   - 错误数据：接口校验层就该拒绝，期望 Err<0。
+#   destroy - 破坏数据：极端/畸形输入，测健壮性（不崩、不泄漏）。
+#
+# 1) 压测池：只放"确定合法"的账号组合，供 gen_account_variety 生成 normal。
+#    压测需要的"变化"应来自业务字段随机化（日期区间、合约代码、价格等），
+#    不能靠改账号属性——属性一旦不匹配，中台要么查不到、要么直接拒绝，
+#    请求根本走不到业务主链路，测出来的吞吐/耗时/字节数全是假的。
+STRESS_ACCOUNT_POOL = [
+    (REAL_ACCOUNT["FAccount"], 7, 6, "0"),   # Model=0, AccountType=7, AccAtt=6, 无空格
+]
+
+# 2) 破坏/错误池：同一账号的各种不匹配变体，专供 gen_fuzz / gen_cross 造
+#    error、destroy 数据。这类数据本来就要"不对"，变体越多覆盖越广。
+#    【禁止】用它生成 normal，否则压测池会被污染。
+REAL_ACCOUNT_POOL = [
+    (REAL_ACCOUNT["FAccount"], 7, 6, "0"),
+    (REAL_ACCOUNT["FAccount"], 7, 6, ""),
+    (REAL_ACCOUNT["FAccount"], 7, 6, "1"),
+    (REAL_ACCOUNT["FAccount"], 7, 0, "0"),
+    (REAL_ACCOUNT["FAccount"], 1, 6, "0"),
+    (REAL_ACCOUNT["FAccount"], 1, 0, "0"),
+    (" " + REAL_ACCOUNT["FAccount"], 7, 6, "0"),
+]
+
+# 旧的多账号池：覆盖资金/客户号、股票/期权、真实与虚拟账号（历史占位账号，已不用于默认并发池）
 ACCOUNT_POOL = [
     ("999993", 1, 6, ""),
     ("999992", 1, 6, ""),
@@ -195,11 +301,29 @@ def _col_index(headers, key):
     raise KeyError(f"列 {key} 不在表头中")
 
 
-def gen_account_variety(headers, template, accounts=ACCOUNT_POOL,
-                        type_tag="normal", start=500):
+def _same_account(headers, template, facct, at, aa, model):
+    """账号四要素是否与模板完全一致（完全一致则生成出的行与模板重复）。"""
+    keys = dict(headers)
+    for key, v in (("FAccount", facct), ("AccountType", at),
+                   ("AccAtt", aa), ("Model", model)):
+        if key not in keys:
+            continue
+        if str(template[_col_index(headers, key)]) != str(v):
+            return False
+    return True
+
+
+def gen_account_variety(headers, template, accounts=STRESS_ACCOUNT_POOL,
+                        type_tag="normal", start=500, skip_same=True):
     """多账号用例：把 template 中账号相关列替换为池子里的值，制造并发负载。
 
     accounts: [(FAccount, AccountType, AccAtt, Model), ...]
+    默认用 STRESS_ACCOUNT_POOL（只含确定合法的组合），生成的是 normal 压测数据。
+    若要造 error/destroy，必须显式传 accounts=REAL_ACCOUNT_POOL 并改 type_tag。
+
+    skip_same: 默认 True，跳过与模板账号完全一致的组合——否则会生成一条和
+    模板报文逐字节相同的行，压测时等于白占一个名额（--max 循环会把它重复发）。
+    压测池只有一条确定合法组合时，本函数返回空列表属正常现象。
     返回完整宽度的行列表（元组）。
     """
     base = list(template)
@@ -207,6 +331,8 @@ def gen_account_variety(headers, template, accounts=ACCOUNT_POOL,
     out = []
     n = start
     for facct, at, aa, model in accounts:
+        if skip_same and _same_account(headers, template, facct, at, aa, model):
+            continue                       # 与模板重复，跳过（编号 n 不递增）
         row = base[:]
         row[_col_index(headers, "case_no")] = f"{type_tag[0].upper()}{n:03d}"
         row[_col_index(headers, "case_type")] = type_tag
@@ -246,7 +372,7 @@ def gen_fuzz(headers, template, fuzz_by_key, type_tag="destroy", start=900):
     return out
 
 
-def gen_cross(headers, template, accounts=ACCOUNT_POOL, injects=(),
+def gen_cross(headers, template, accounts=REAL_ACCOUNT_POOL, injects=(),
               type_tag="destroy", start=300):
     """交叉破坏：对每个 (账号, 注入) 生成一行，在账号模板上替换指定列。
 
