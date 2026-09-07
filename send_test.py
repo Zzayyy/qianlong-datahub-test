@@ -97,6 +97,23 @@ def _log_quiet_error(tag, msg):
         print(f"  [{tag}] 安静模式：后续同类错误仅计数，不再逐条打印")
 
 
+def _sep(title=""):
+    """打印分割线（安静模式跳过），可带标题，用于隔开每条报文/回复"""
+    if QUIET:
+        return
+    if title:
+        print(f"{'-' * 8} {title} {'-' * max(4, 60 - len(title) - 2)}")
+    else:
+        print("-" * 60)
+
+
+def _banner(title):
+    """运行起始/结束分割线：不受安静模式影响，便于在 GUI 批量日志中区分各次发送"""
+    print("=" * 70)
+    print(title)
+    print("=" * 70)
+
+
 class _Tee:
     """把 stdout 同时写到终端和运行日志文件（每行即时 flush 到文件）"""
 
@@ -284,6 +301,7 @@ class DataHubClient:
             if self._expect and n >= self._expect:
                 self._replied.set()
             if not QUIET:
+                _sep("reply")
                 print(f"  [reply] id={msg_id} req_id={s2} data={s1[:200]}")
 
         self._cb = _ReplyCb(_on_msg)
@@ -483,6 +501,7 @@ def destroy_write_redis(payload, req_id, destroy_mode="type1", server_id="12345"
         conn.close()
         if not QUIET:
             tag = f"#{idx}" if idx is not None else ""
+            _sep("DESTROY")
             print(f"  [DESTROY/{destroy_mode}{tag}] 已直写 DataHub_req_stream: {req_id}"
                   f" server_id={fields.get('server_id', '')}")
         return True
@@ -619,6 +638,7 @@ def main():
     run_log = os.path.join(run_dir, f"{mod.NAME}_{time.strftime('%Y%m%d_%H%M%S')}.log")
     _orig_stdout = sys.stdout
     sys.stdout = _Tee(_orig_stdout, open(run_log, "w", encoding="utf-8"))
+    _banner(f"[START] {mod.NAME} · send_test · {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     excel = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
     cases = load_cases(excel, 0)   # 先读全部
@@ -677,6 +697,7 @@ def main():
             p = str(c.get("case_desc"))
         payloads.append(p)
         if not QUIET:
+            _sep(c["_no"])
             print(f"  {c['_no']} [{c['_type']}] {p[:160]}")
 
     so = find_so(args.so)
@@ -823,6 +844,7 @@ def main():
         with client._lock:
             sample = client._replies[:10]
         for rid, data in sample:
+            _sep("reply sample")
             print(f"    req_id={rid} -> {data[:200]}")
 
     finally:
@@ -859,6 +881,7 @@ def main():
                 traceback.print_exc()
         print(f"[INFO] 运行日志已保存: {run_log}")
         print("[INFO] 插件有后台线程，直接强制退出（跳过 DestroyMQ）")
+        _banner(f"[END] {mod.NAME} · {time.strftime('%Y-%m-%d %H:%M:%S')}")
         sys.stdout.flush()
         sys.stdout = _orig_stdout
         os._exit(0)

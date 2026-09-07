@@ -1415,6 +1415,7 @@ class MainWindow(QWidget):
             self.set_running(False)
             return
         name = names[idx]
+        self.append_log("─" * 72)
         if len(names) > 1:
             self.append_log(f"[BATCH] ({idx + 1}/{len(names)}) 接口 {name} 开始...")
 
