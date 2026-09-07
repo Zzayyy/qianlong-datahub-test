@@ -408,13 +408,19 @@ DEFAULT_CONFIG = {
     "vsplit": "",        # 上下分栏比例（自动记忆）
 }
 
-# 批量汇总表格列：(表头, summary JSON 里的键)。interface 取顶层字段
+# 批量汇总表格列：(表头, summary JSON 里的键)。interface 取顶层字段。
+# 注意：发送成功/发送失败只统计到"请求递交"（插件 SendMQ 返回 / destroy 直写 XADD 写流），
+# 不代表中台已处理；中台是否回复要看"期望回复/收到回复/缺回复/回复率"列。
 SUMMARY_COLS = [
     ("接口", "interface"),
     ("总请求数", "总请求数"),
-    ("成功", "成功数"),
-    ("失败", "失败数"),
+    ("发送成功", "成功数"),
+    ("发送失败", "失败数"),
     ("成功率%", "成功率%"),
+    ("期望回复", "期望回复数"),
+    ("收到回复", "收到回复数"),
+    ("缺回复", "缺回复数"),
+    ("回复率%", "回复率%"),
     ("吞吐(条/s)", "吞吐(条/s,按发送耗时)"),
     ("CPU平均%", "CPU平均%"),
     ("CPU峰值%", "CPU峰值%"),
@@ -863,13 +869,20 @@ class MainWindow(QWidget):
         self.table_summary.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table_summary.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table_summary.verticalHeader().setVisible(False)
-        # 全宽后 19 列基本一屏可见：接口列拉伸，其余固定宽，仍超出时才横向滚动
+        # 列数随 SUMMARY_COLS 走：接口列拉伸，其余默认宽，超出时横向滚动
         hdr = self.table_summary.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hdr.setDefaultSectionSize(84)
         hdr.setMinimumSectionSize(60)
         hdr.resizeSection(0, 130)
+        for _ci, _w in {1: 92, 2: 92, 3: 92, 4: 88, 5: 96, 6: 96, 7: 84, 8: 88}.items():
+            hdr.resizeSection(_ci, _w)
+        self.table_summary.setToolTip(
+            "发送成功/发送失败 = 请求是否成功递交（走插件看 SendMQ 返回，破坏直写看 XADD 写流），\n"
+            "不代表中台已处理。中台是否回复看「期望/收到/缺回复/回复率」列：\n"
+            "中台中途崩溃、不再回复时，发送列仍可能全成功，但「缺回复」会 >0。\n"
+            "纯 destroy 直写无回复预期，相关列显示 N/A。")
         self.table_summary.setStyleSheet(
             "QTableWidget { background: #fafafa; border: 1px solid #ddd; border-radius: 4px; }"
             "QHeaderView::section { background: #e8f0fe; font-weight: bold;"
@@ -1050,15 +1063,34 @@ class MainWindow(QWidget):
             cpu_peak = [self._safe_float(s.get("CPU峰值%")) for _, s in rows]
             cpu_peak = [v for v in cpu_peak if v > 0]
             redis_inc = sum(self._safe_float(s.get("Redis写入增量")) for _, s in rows)
+            # 回复列：仅累计数值（纯 destroy/旧 JSON 的 "N/A" 不计入），
+            # 缺回复=各接口缺失数求和；回复率=收到合计/期望合计
+            def _num_vals(key):
+                vals = []
+                for _, s in rows:
+                    v = s.get(key)
+                    if isinstance(v, (int, float)):
+                        vals.append(float(v))
+                return vals
+            exp_vals = _num_vals("期望回复数")
+            got_vals = _num_vals("收到回复数")
+            miss_vals = _num_vals("缺回复数")
+            exp = sum(exp_vals)
+            got = sum(got_vals)
+            miss = sum(miss_vals)
             agg[0] = "合计"
             agg[1] = total
             agg[2] = ok
             agg[3] = fail
             agg[4] = round(ok / total * 100, 2) if total else 0
-            agg[5] = round(thr, 2)
-            agg[6] = round(sum(cpu_avg) / len(cpu_avg), 1) if cpu_avg else ""
-            agg[7] = round(max(cpu_peak), 1) if cpu_peak else ""
-            agg[8] = redis_inc
+            agg[5] = round(exp, 1) if exp_vals else ""
+            agg[6] = round(got, 1) if got_vals else ""
+            agg[7] = round(miss, 1) if miss_vals else ""
+            agg[8] = round(got / exp * 100, 2) if exp > 0 else ""
+            agg[9] = round(thr, 2)
+            agg[10] = round(sum(cpu_avg) / len(cpu_avg), 1) if cpu_avg else ""
+            agg[11] = round(max(cpu_peak), 1) if cpu_peak else ""
+            agg[12] = redis_inc
             self._set_summary_row(len(rows), agg, bold=True)
 
     def _set_summary_row(self, row, vals, bold=False):

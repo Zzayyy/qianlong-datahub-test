@@ -116,6 +116,9 @@ class PerfStats:
         self.send_ok = 0
         self.send_fail = 0
         self.redis_write_ok = 0        # 直写 Redis(XADD) 同步成功数（destroy 测试精确计数）
+        self.reply_got = 0             # 实际收到的中台回复数（wait_replies 结束后写入）
+        self.reply_expect = 0          # 期望回复数（走插件的用例数；destroy 直写无回复预期）
+        self.reply_recorded = False    # 是否已写入回复结果（未记录时汇总显示 N/A）
         self.bytes_ok = 0              # 成功请求的字节
         self.bytes_fail = 0            # 失败请求的字节
         self._sampler = None
@@ -169,6 +172,19 @@ class PerfStats:
         with self.lock:
             if ok:
                 self.redis_write_ok += 1
+
+    def set_reply_result(self, got, expect):
+        """记录中台回复结果：got=实际收到回复数，expect=期望回复数（走插件的用例数）。
+
+        发送统计（成功/失败）只统计到"请求递交"（SendMQ / XADD 返回成功），
+        不包含中台回复。中台崩溃或丢回复时 reply_got < reply_expect，
+        汇总里靠"期望回复/收到回复/缺回复/回复率"字段才能发现。
+        expect<=0（纯 destroy 直写，无回复预期）时回复率记为 N/A。
+        """
+        with self.lock:
+            self.reply_got = got
+            self.reply_expect = max(0, expect)
+            self.reply_recorded = True
 
     # ---------- 采样线程 ----------
     def start(self, interval=1.0):
@@ -297,6 +313,14 @@ class PerfStats:
                 "Redis写入增量": redis_written,
                 "Redis写入(采样参考)": redis_inc,
                 "每秒采样点数": len(self.per_sec),
+                # 中台回复：发送成功/失败只代表"递交成功"，回复情况在此单列，
+                # 中台中途崩溃时期望回复>0 而收到回复不足，缺回复/回复率可暴露
+                "期望回复数": self.reply_expect if self.reply_recorded else "N/A",
+                "收到回复数": self.reply_got if self.reply_recorded else "N/A",
+                "缺回复数": (max(self.reply_expect - self.reply_got, 0)
+                            if self.reply_recorded and self.reply_expect > 0 else "N/A"),
+                "回复率%": ((self.reply_got / self.reply_expect * 100)
+                           if self.reply_recorded and self.reply_expect > 0 else "N/A"),
                 # 数据中台未开放
                 "返回字节(B)": "N/A(数据中台未开放)",
                 "业务响应时间(µs)": "N/A(数据中台未开放)",

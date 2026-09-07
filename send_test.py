@@ -877,6 +877,10 @@ def main():
             print(f"[INFO] 无走插件的用例，等待 {args.wait}s 收集残留回复...")
             got = client.wait_replies(0, args.wait)
             print(f"[RESULT] 收到回复数: {got}")
+        # 中台回复写入统计：汇总表的成功/失败只统计到"递交"（SendMQ/XADD 返回），
+        # 中台中途崩溃、请求已递交但无回复时，必须靠"收到回复数/缺回复数"暴露
+        if stats:
+            stats.set_reply_result(got, expect)
         with client._lock:
             sample = client._replies[:10]
         for rid, data in sample:
