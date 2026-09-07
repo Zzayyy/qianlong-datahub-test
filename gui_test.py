@@ -439,9 +439,10 @@ def load_config():
         cp = configparser.ConfigParser()
         cp.read(CONFIG_PATH, encoding="utf-8")
         if cp.has_section("main"):
-            for k in cfg:
-                if cp.has_option("main", k):
-                    cfg[k] = cp.get("main", k)
+            # 读入文件里的全部键（含 r_db 等不在 DEFAULT_CONFIG 里的项），
+            # 避免写进 config.ini 的值启动时被过滤丢失
+            for k, v in cp.items("main"):
+                cfg[k] = v
     except Exception:
         pass
     return cfg
@@ -1238,6 +1239,10 @@ class MainWindow(QWidget):
             "username": self.edit_user.text().strip(),
             "password": self.edit_pass.text(),
             "remote_dir": self.edit_remote_dir.text().strip(),
+            "r_host": self.edit_r_host.text().strip(),
+            "r_port": self.edit_r_port.text().strip(),
+            "r_pwd": self.edit_r_pwd.text(),
+            "r_db": str(self.spin_r_db.value()),
             "workers": str(self.spin_workers.value()),
             "max": str(self.spin_max.value()),
             "wait": str(self.spin_wait.value()),
