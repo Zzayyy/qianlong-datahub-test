@@ -400,6 +400,7 @@ DEFAULT_CONFIG = {
     "remote": "1",       # 启用远程执行
     "quiet": "1",        # 安静模式
     "cases": "",         # 用例编号筛选（空=全部）
+    "preview": "0",      # 预览模式（--no-send，只生成报文不发送）
     "box_redis": "1",    # 右侧三个标题条的展开状态
     "box_linux": "1",
     "box_out": "1",
@@ -714,6 +715,16 @@ class MainWindow(QWidget):
             "· 与「用例类型」叠加过滤；留空发全部\n"
             "查看发送的报文：关掉安静模式可逐条打印；--no-send 预览可存 out/{接口}_requests.jsonl")
         g2.addWidget(self.edit_cases, 5, 1, 1, 3)
+
+        # 行6：预览模式（--no-send，只生成报文不发送）
+        self.chk_preview = QCheckBox("预览模式 (只生成报文不发送，存 out/{接口}_requests.jsonl)")
+        self.chk_preview.setChecked(self.cfg.get("preview", "0") == "1")
+        self.chk_preview.setToolTip(
+            "勾选后构造报文但不发送（等价 --no-send）：\n"
+            "· 远程执行时也在远程生成 jsonl 并自动下载到本地 out/requests/\n"
+            "· 用于核对动态单号(__REFn__)展开、字段内容是否正确\n"
+            "· 本地 Windows 没有 .so，不勾选也只会预览")
+        g2.addWidget(self.chk_preview, 6, 0, 1, 4)
         left_lay.addWidget(grp2)
 
         # ---- 远程 Linux（发送测试在其上执行）----
@@ -1216,6 +1227,8 @@ class MainWindow(QWidget):
         if cases_spec:
             parts.append("--cases")
             parts.append(cases_spec)
+        if self.chk_preview.isChecked():
+            parts.append("--no-send")
         if self.chk_mock.isChecked():
             parts.append("--mock")
         else:
@@ -1249,6 +1262,7 @@ class MainWindow(QWidget):
             "mock": "1" if self.chk_mock.isChecked() else "0",
             "quiet": "1" if self.chk_quiet.isChecked() else "0",
             "cases": self.edit_cases.text().strip(),
+            "preview": "1" if self.chk_preview.isChecked() else "0",
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
             "destroy_mode": self.combo_destroy_mode.currentData() or "mixed",
             "remote": "1" if self.chk_remote.isChecked() else "0",
@@ -1373,6 +1387,7 @@ class MainWindow(QWidget):
             "破坏类型": self.combo_destroy_mode.currentData() or "mixed",
             "安静模式": "开" if self.chk_quiet.isChecked() else "关",
             "用例编号(cases)": self.edit_cases.text().strip() or "全部",
+            "预览模式": "开" if self.chk_preview.isChecked() else "关",
             "远程执行": "开" if self.chk_remote.isChecked() else "关",
             "远程主机": self.edit_host.text().strip(),
             "远程目录": self.edit_remote_dir.text().strip(),
@@ -1402,6 +1417,13 @@ class MainWindow(QWidget):
                 "remote": rd + "/logs",
                 "local": os.path.join(os.path.dirname(local_perf), "logs"),
                 "patterns": [f"{name}_*.log"],
+            })
+        # 预览模式：把远程生成的报文 jsonl 下载到本地 out/requests/
+        if self.chk_preview.isChecked():
+            dirs.append({
+                "remote": rd,
+                "local": os.path.join(os.path.dirname(local_perf), "requests"),
+                "patterns": [f"{name}_requests.jsonl"],
             })
         return {"dirs": dirs}
 
