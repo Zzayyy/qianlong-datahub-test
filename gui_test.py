@@ -399,6 +399,7 @@ DEFAULT_CONFIG = {
     "download_dir": "out/performance",
     "remote": "1",       # 启用远程执行
     "quiet": "1",        # 安静模式
+    "cases": "",         # 用例编号筛选（空=全部）
     "box_redis": "1",    # 右侧三个标题条的展开状态
     "box_linux": "1",
     "box_out": "1",
@@ -699,6 +700,19 @@ class MainWindow(QWidget):
             "mixed：四种按顺序轮发\n"
             "对比：error用例走插件，task合法且协议格式，只破坏④业务校验")
         g2.addWidget(self.combo_destroy_mode, 4, 1, 1, 3)
+
+        # 行5：用例编号筛选（--cases），定位中台挂掉时逐条/分段发送
+        g2.addWidget(QLabel("用例编号:"), 5, 0)
+        self.edit_cases = QLineEdit(self.cfg.get("cases", ""))
+        self.edit_cases.setPlaceholderText("如 C1,C3-C10 或 5-20（空=全部）")
+        self.edit_cases.setToolTip(
+            "只发送指定用例，用于逐条排查中台崩溃：\n"
+            "· C 编号按 Excel「用例编号」列匹配（忽略大小写/前导零），如 C1、C005、C3-C10\n"
+            "· 纯数字按 Excel 数据行号匹配（1 起始），如 5、5-20\n"
+            "· 逗号分隔可混用：C1,C3-C10,25\n"
+            "· 与「用例类型」叠加过滤；留空发全部\n"
+            "查看发送的报文：关掉安静模式可逐条打印；--no-send 预览可存 out/{接口}_requests.jsonl")
+        g2.addWidget(self.edit_cases, 5, 1, 1, 3)
         left_lay.addWidget(grp2)
 
         # ---- 远程 Linux（发送测试在其上执行）----
@@ -1197,6 +1211,10 @@ class MainWindow(QWidget):
         if types and len(types) < 3:
             parts.append("--type")
             parts.append(",".join(types))
+        cases_spec = self.edit_cases.text().strip()
+        if cases_spec:
+            parts.append("--cases")
+            parts.append(cases_spec)
         if self.chk_mock.isChecked():
             parts.append("--mock")
         else:
@@ -1225,6 +1243,7 @@ class MainWindow(QWidget):
             "wait": str(self.spin_wait.value()),
             "mock": "1" if self.chk_mock.isChecked() else "0",
             "quiet": "1" if self.chk_quiet.isChecked() else "0",
+            "cases": self.edit_cases.text().strip(),
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
             "destroy_mode": self.combo_destroy_mode.currentData() or "mixed",
             "remote": "1" if self.chk_remote.isChecked() else "0",
@@ -1348,6 +1367,7 @@ class MainWindow(QWidget):
             "破坏数据走插件": "开" if self.chk_destroy_plugin.isChecked() else "关",
             "破坏类型": self.combo_destroy_mode.currentData() or "mixed",
             "安静模式": "开" if self.chk_quiet.isChecked() else "关",
+            "用例编号(cases)": self.edit_cases.text().strip() or "全部",
             "远程执行": "开" if self.chk_remote.isChecked() else "关",
             "远程主机": self.edit_host.text().strip(),
             "远程目录": self.edit_remote_dir.text().strip(),

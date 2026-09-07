@@ -201,6 +201,55 @@ def load_cases(excel, max_cases):
     return cases
 
 
+def parse_case_spec(spec):
+    """解析用例编号筛选表达式，如 'C1,C3-C10,25-30'。逗号/空白分隔，可混用。
+    返回 (singles, ranges)：
+      singles: {(前缀大写或'', 数字), ...}   前缀 '' 表示按 Excel 数据行号（1 起始）
+      ranges:  [(前缀大写或'', 起始, 结束), ...]
+    """
+    singles, ranges = set(), []
+    for tok in re.split(r"[,，;\s]+", spec.strip()):
+        if not tok:
+            continue
+        m = re.fullmatch(r"([A-Za-z]?)(\d+)(?:-([A-Za-z]?)(\d+))?", tok)
+        if not m:
+            raise ValueError(f"无法识别的用例编号: {tok}（示例: C1 / C3-C10 / 5-20）")
+        p1, n1 = m.group(1).upper(), int(m.group(2))
+        if m.group(3) is None:
+            singles.add((p1, n1))
+        else:
+            p2 = (m.group(3) or p1).upper()   # 右端省略前缀时沿用左端（如 C3-10）
+            if p1 != p2:
+                raise ValueError(f"范围前后编号前缀不一致: {tok}")
+            a, b = sorted((n1, int(m.group(4))))
+            ranges.append((p1, a, b))
+    return singles, ranges
+
+
+def filter_cases_by_spec(cases, spec):
+    """按用例编号/行号筛选用例。
+    C 编号（如 C1/C005）匹配 Excel「用例编号」列，忽略大小写与前导零；
+    纯数字（如 5）按 Excel 数据行号匹配（1 起始）。返回筛选后的列表。"""
+    singles, ranges = parse_case_spec(spec)
+
+    def _no_key(c):
+        m = re.match(r"([A-Za-z]?)0*(\d+)$", str(c["_no"]).strip())
+        return (m.group(1).upper(), int(m.group(2))) if m else None
+
+    picked = []
+    for i, c in enumerate(cases, 1):
+        key = _no_key(c)
+        hit = key is not None and (
+            key in singles
+            or any(p == key[0] and a <= key[1] <= b for p, a, b in ranges))
+        if not hit:
+            hit = (("", i) in singles
+                   or any(p == "" and a <= i <= b for p, a, b in ranges))
+        if hit:
+            picked.append(c)
+    return picked
+
+
 # ==================== 插件客户端 ====================
 _ReplyCb = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p)
 
@@ -524,6 +573,11 @@ def main():
     ap.add_argument("--type", default="",
                     help="只发指定用例类型，逗号分隔，如 normal,error,destroy,probe"
                          "（空=全部；压测建议只传 normal）")
+    ap.add_argument("--cases", default="",
+                    help="只发指定用例，用于逐条排查中台问题："
+                         "C 编号按用例编号列匹配（如 C1,C3-C10），"
+                         "纯数字按 Excel 数据行号匹配（1 起始，如 5-20）；"
+                         "逗号分隔可混用，空=全部")
     ap.add_argument("--wait", type=float, default=3.0, help="发完后等待回复秒数")
     ap.add_argument("--reply", type=int, default=0, choices=[0, 1], help="reply_flag")
     ap.add_argument("--init-wait", type=float, default=5.0, help="等待插件 inited 最大秒数(兜底超时，正常2-3s即探测到)")
@@ -571,6 +625,18 @@ def main():
     # 空数据必须在这里拦掉：否则下面 --max 循环扩量时 base 为空会陷入死循环
     if not cases:
         sys.exit(f"[FAIL] {excel} 中无有效用例（表头之后没有数据行）")
+    # --cases 过滤：按用例编号/行号指定发送（先于 --type，行号对齐 Excel 原始顺序）
+    if args.cases.strip():
+        try:
+            cases = filter_cases_by_spec(cases, args.cases)
+        except ValueError as e:
+            sys.exit(f"[FAIL] {e}")
+        if not cases:
+            sys.exit(f"[FAIL] 用例编号 {args.cases} 未匹配到任何用例，"
+                     f"请核对 Excel 用例编号列（如 C001）或行号")
+        _shown = ",".join(c["_no"] for c in cases[:20])
+        print(f"[INFO] 用例编号筛选 {args.cases}: 匹配 {len(cases)} 条"
+              + (f"（{_shown}, ...）" if len(cases) > 20 else f"（{_shown}）"))
     # --type 过滤：只发指定用例类型（normal/error/destroy，可逗号分隔）
     if args.type:
         allowed = {t.strip().lower() for t in args.type.split(",") if t.strip()}

@@ -65,6 +65,7 @@ python send_test.py --interface create --type destroy --destroy-mode mixed  # �
 | `--workers` | 4 | 并发线程数 |
 | `--max` | 0（全部） | 最多发送条数，超出时循环复用 Excel 用例 |
 | `--type` | 全部 | 用例类型过滤：normal,error,destroy |
+| `--cases` | 全部 | 按用例编号/行号筛选发送，如 `C1,C3-C10,25`（C 编号匹配用例编号列，纯数字按数据行号；定位中台崩溃用） |
 | `--wait` | 3.0 | 发完后等待回复秒数（收齐即提前结束） |
 | `--destroy-mode` | 空（轮发） | 破坏类型，见上表 |
 | `--destroy-via-plugin` | 关 | 破坏数据也走插件 SendMQ |
