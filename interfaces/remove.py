@@ -10,14 +10,14 @@
               "Refs": ["20260528000010", "20260604000001"]}}
 
 2026-09 更新：原来用的 FAccount=300130000461、Refs=26319550 均为占位，线上删不掉。
-现统一改用线上真实账号（_common.REAL_ACCOUNT）+ doc 真实样本里的云单引用
-（_common.REAL_REFS：create 返回的 20260528000010、remove 样本里的 20260604000001）。
-注意：Ref 必须是该账号下真实存在的云单；若中台报"云单不存在"，用 query 的返回回填即可。
+现统一改用线上真实账号（_common.REAL_ACCOUNT）+ __REF1__/__REF2__ 动态条件单号
+（发送时按 日期+顺序号 展开，如 20260904000001），配合先跑 create。
+注意：若当天该账号在测试之外还开过单，顺序号会顺延，需按 create 实际返回回填。
 """
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import (expand, build_account, REAL_ACCOUNT, REAL_REFS, FAKE_REF,
+from _common import (expand, build_account, REAL_ACCOUNT, FAKE_REF,
                      STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL,
                      gen_account_variety, gen_fuzz, gen_cross)
 
@@ -25,7 +25,8 @@ NAME = "remove"
 TITLE = "删除云条件单(remove)"
 
 FACCOUNT = REAL_ACCOUNT["FAccount"]
-REF1, REF2 = REAL_REFS[0], REAL_REFS[1]
+REF1, REF2 = "__REF1__", "__REF2__"
+REF3, REF4 = "__REF3__", "__REF4__"
 
 HEADERS = [
     ("case_no", "用例编号"),
@@ -42,12 +43,15 @@ HEADERS = [
 # ==================== 测试数据（全部基于真实账号+真实云单引用，只改被测字段）====================
 ROWS = [
     # ---------- normal：压测池（账号四要素与真实账号完全匹配）----------
+    # 各 normal 行引用互不重叠的单号：R001 删 1 号，R002 删 2、3 号，
+    # 避免 R001 删掉后 R002 引用已不存在的单号
     ["R001", "normal", "删除一个云单(真实Ref)", 0, 7, 6, FACCOUNT, REF1, "主用例：模板行，字段值勿改"],
-    ["R002", "normal", "删除多个云单(真实Ref)", 0, 7, 6, FACCOUNT, f"{REF1},{REF2}", "两个真实引用"],
+    ["R002", "normal", "删除多个云单(真实Ref)", 0, 7, 6, FACCOUNT, f"{REF2},{REF3}", "删除 2、3 号两张单"],
     # ---------- probe：兼容性探测，结果不确定，不计入压测指标 ----------
-    ["R003", "probe", "正确账号 不带 Model", "", 7, 6, FACCOUNT, REF1, "省略 Model，看是否必填"],
-    ["R004", "probe", "正确账号 Model=1(独立运行模式)", 1, 7, 6, FACCOUNT, REF1, "覆盖 Model 字段"],
-    ["R005", "probe", "正确账号 AccAtt=0(股票渠道)", 0, 7, 0, FACCOUNT, REF1, "渠道变体"],
+    # probe 用 4 号单（normal 行没碰过的）；若前面已把它删掉则返回不存在，属探测范围内的结果
+    ["R003", "probe", "正确账号 不带 Model", "", 7, 6, FACCOUNT, REF4, "省略 Model，看是否必填"],
+    ["R004", "probe", "正确账号 Model=1(独立运行模式)", 1, 7, 6, FACCOUNT, REF4, "覆盖 Model 字段"],
+    ["R005", "probe", "正确账号 AccAtt=0(股票渠道)", 0, 7, 0, FACCOUNT, REF4, "渠道变体"],
     # ---------- 错误 ----------
     ["R101", "error", "Refs 为空", 0, 7, 6, FACCOUNT, "", "期望被拒绝/Err<0"],
     ["R102", "error", "Refs 不存在", 0, 7, 6, FACCOUNT, FAKE_REF, "云单不存在，期望 Err<0"],
@@ -87,7 +91,10 @@ ROWS = ROWS + _ROWS_BULK
 def build_payload(row: dict) -> dict:
     account = build_account(row)
     payload = {"remove": {"Account": account}}
-    refs = expand(row.get("Refs"))
+    refs = row.get("Refs")
     if refs is not None and str(refs).strip() != "":
-        payload["remove"]["Refs"] = [s.strip() for s in str(refs).split(",") if s.strip()]
+        # 先整串展开（支持 __REF1_10__ 范围标记 -> 逗号列表），再拆分逐项展开
+        text = str(expand(refs))
+        payload["remove"]["Refs"] = [str(expand(s)).strip()
+                                     for s in text.split(",") if s.strip()]
     return payload

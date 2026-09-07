@@ -9,13 +9,14 @@
 2026-09 更新：原来用的 FAccount=300130000461、Ref=26319550/26319551 均为占位，
 线上改不动单。现全部改用真实数据：
   - 账号与委托/条件字段：同 create.py（_common.REAL_ACCOUNT + 真实合约 90007939 等）
-  - Ref：_common.REAL_REFS[0]（doc 真实样本中 create 返回的 20260528000010）
-    注意：Ref 必须是该账号下真实存在的云单，若中台报"云单不存在"，用 query 的返回回填。
+  - Ref：__REF1__ 动态条件单号（发送时按 日期+顺序号 展开，如 20260904000001），
+    配合先跑 create：当天 create 返回的第一批单号即 日期+000001/000002...
+    注意：若当天该账号在测试之外还开过单，顺序号会顺延，需按 create 实际返回回填。
 """
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import (expand, build_account, to_typed, REAL_ACCOUNT, REAL_REFS, FAKE_REF,
+from _common import (expand, build_account, to_typed, REAL_ACCOUNT, FAKE_REF,
                      REAL_ENTRUST, STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL,
                      gen_account_variety, gen_fuzz, gen_cross)
 import create as _create
@@ -24,7 +25,7 @@ NAME = "modify"
 TITLE = "修改云条件单(modify)"
 
 FACCOUNT = REAL_ACCOUNT["FAccount"]
-REF1 = REAL_REFS[0]
+REF1 = "__REF1__"
 
 # 表头 = create 的表头 + Ref（FAccount 之后）+ ChangedFields（末尾）
 HEADERS = (_create.HEADERS[:7]

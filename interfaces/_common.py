@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """接口定义的公共辅助工具"""
+import re
+import time
 
 # 破坏测试 token -> 真实数据（Excel 存不了控制字符/超长串）
 TOKEN_MAP = {
@@ -97,12 +99,42 @@ INT_LEAVES = {
 BOOL_LEAVES = {"CoveredType", "EndWithdraw", "Removed"}
 
 
+def make_ref(n=1):
+    """按线上规则生成条件单号：日期(YYYYMMDD) + 6位顺序号。
+
+    create 成功后返回的条件单号即此格式（如 20260904000001、20260904000002），
+    当天该账号新开的第 n 张单就是 日期+n。modify/set/remove 的 normal 用例
+    在 create 之后执行，用 __REF1__/__REF2__ 即可对上刚开的单。
+    在发送时（build_payload）才展开，日期取发送当天。
+    """
+    return f"{time.strftime('%Y%m%d')}{max(1, int(n)):06d}"
+
+
+_REF_TOKEN_RE = re.compile(r"__REF(\d+)__")
+_REF_RANGE_RE = re.compile(r"__REF(\d+)_(\d+)__")
+
+
 def expand(v):
-    """token 展开成破坏数据；普通值原样返回。"""
+    """token 展开成破坏/动态数据；普通值原样返回。
+
+    动态条件单号（日期+顺序号，发送时才展开）：
+      __REF3__      -> 单个，如 20260907000003
+      __REF1_10__   -> 范围，展开成逗号分隔的 1~10 号（配合 set/remove 的 Refs 列）
+    其余 token 查 TOKEN_MAP。
+    """
     if v is None:
         return None
     s = str(v).strip()
-    return TOKEN_MAP.get(s, v)
+    if s in TOKEN_MAP:
+        return TOKEN_MAP[s]
+    m = _REF_TOKEN_RE.fullmatch(s)
+    if m:
+        return make_ref(m.group(1))
+    m = _REF_RANGE_RE.fullmatch(s)
+    if m:
+        a, b = sorted((int(m.group(1)), int(m.group(2))))
+        return ",".join(make_ref(i) for i in range(a, b + 1))
+    return v
 
 
 def to_typed(leaf, v):
@@ -185,8 +217,8 @@ REAL_SIGN = {
 # 股东号：[ (SAccount, ExchangeNum), ... ]  1=上海 2=深圳
 REAL_SHAREHOLDERS = [("A442523077", 1), ("0199908393", 2)]
 
-# 云单引用：doc 真实样本中出现过的 Ref（create 返回 20260528000010 / remove 使用 20260604000001）
-# 注意：Ref 必须是该账号下真实存在的云单，若中台返回"不存在"，用 query 结果回填即可。
+# 云单引用：doc 历史样本（20260528000010 / 20260604000001）已过期，normal 用例不再使用。
+# 现统一用 __REF1__/__REF2__ 动态单号（expand 时按 日期+顺序号 生成，见 make_ref）。
 REAL_REFS = ["20260528000010", "20260604000001"]
 # 不存在的引用（错误用例专用，格式与真实 Ref 一致）
 FAKE_REF = "20991231000000"

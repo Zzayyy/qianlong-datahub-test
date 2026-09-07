@@ -11,13 +11,14 @@
            "Refs": ["20260528000010", "20260604000001"]}}
 
 2026-09 更新：原来用的 FAccount=300130000461、Refs=26319550 均为占位，线上跑不起来。
-现统一改用线上真实账号（_common.REAL_ACCOUNT）+ doc 真实样本里的云单引用
-（_common.REAL_REFS）。注意：Ref 必须是该账号下真实存在的云单，可用 query 回填。
+现统一改用线上真实账号（_common.REAL_ACCOUNT）+ __REF1__/__REF2__ 动态条件单号
+（发送时按 日期+顺序号 展开，如 20260904000001），配合先跑 create。
+注意：若当天该账号在测试之外还开过单，顺序号会顺延，需按 create 实际返回回填。
 """
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import (expand, build_account, to_typed, REAL_ACCOUNT, REAL_REFS, FAKE_REF,
+from _common import (expand, build_account, to_typed, REAL_ACCOUNT, FAKE_REF,
                      STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL,
                      gen_account_variety, gen_fuzz, gen_cross)
 
@@ -25,7 +26,7 @@ NAME = "set"
 TITLE = "运行/停止云条件单(set)"
 
 FACCOUNT = REAL_ACCOUNT["FAccount"]
-REF1, REF2 = REAL_REFS[0], REAL_REFS[1]
+REF1, REF2 = "__REF1__", "__REF2__"
 
 HEADERS = [
     ("case_no", "用例编号"),
@@ -97,7 +98,10 @@ def build_payload(row: dict) -> dict:
     if mode is not None and str(mode).strip() != "":
         payload["set"]["Mode"] = to_typed("Mode", mode)
 
-    refs = expand(row.get("Refs"))
+    refs = row.get("Refs")
     if refs is not None and str(refs).strip() != "":
-        payload["set"]["Refs"] = [s.strip() for s in str(refs).split(",") if s.strip()]
+        # 先整串展开（支持 __REF1_10__ 范围标记 -> 逗号列表），再拆分逐项展开
+        text = str(expand(refs))
+        payload["set"]["Refs"] = [str(expand(s)).strip()
+                                  for s in text.split(",") if s.strip()]
     return payload
