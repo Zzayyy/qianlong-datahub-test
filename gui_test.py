@@ -566,7 +566,7 @@ class MainWindow(QWidget):
         cols = 4
         for i, name in enumerate(names):
             chk = QCheckBox(name)
-            chk.setChecked(True)              # 默认全选
+            chk.setChecked(False)             # 默认全不勾选，按需勾选再跑
             chk.toggled.connect(self.update_interfaces_label)
             self.chk_ifaces[name] = chk
             g1.addWidget(chk, i // cols, i % cols)
