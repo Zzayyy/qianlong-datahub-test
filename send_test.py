@@ -581,6 +581,39 @@ def destroy_write_all(items, stats, batch_size=500, concurrency=4):
     return ok, time.time() - t0, "串行逐条(未安装redis库)"
 
 
+def show_reply_streams():
+    """在日志中提示中台回复落点：从 DataHub_req_stream 最近几条请求里
+    提取 reply_req_stream / reply_reply_stream 字段的实际键名（安静模式也打印）。"""
+    try:
+        conn = RespClient(REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, db=REDIS_SELECT)
+        conn.connect()
+        resp = conn.cmd("XREVRANGE", REQ_STREAM, "+", "-", "COUNT", "50")
+        conn.close()
+    except Exception as e:
+        _log_quiet_error("INFO", f"读取回复流名失败: {e}")
+        return
+    streams = []
+    for entry in resp or []:
+        # entry 形如 [id, [f1, v1, f2, v2, ...]]
+        fields = entry[1] if isinstance(entry, list) and len(entry) > 1 else []
+        kv = dict(zip(fields[0::2], fields[1::2]))
+        for k in ("reply_req_stream", "reply_reply_stream"):
+            v = kv.get(k)
+            if v and v not in streams:
+                streams.append(v)
+    # 破坏测试 type1/2 的 reply 流是故意乱填的，优先展示插件真实使用的 WT- 开头流名
+    streams.sort(key=lambda s: not s.startswith("WT-"))
+    streams = streams[:4]
+    if not streams:
+        print("[INFO] DataHub_req_stream 中暂无请求（回复流名未知），"
+              "可发送后再看本提示")
+        return
+    print(f"[INFO] 中台回复写入键（取自最近请求 reply_*_stream 字段）: "
+          f"{', '.join(streams)}")
+    print(f"[INFO] 查看中台回复: XREVRANGE {streams[0]} - + COUNT 5"
+          f"（redis-cli，SELECT {REDIS_SELECT}）")
+
+
 # ==================== 主流程 ====================
 def main():
     ap = argparse.ArgumentParser(description="通用多线程压测")
@@ -827,6 +860,9 @@ def main():
         # 标记发送阶段结束
         if stats:
             stats.mark_send_end()
+
+        # 提示中台回复落点：请求已入流，从最近请求的 reply_*_stream 字段取实际键名
+        show_reply_streams()
 
         # 收齐即停：期望条数 = 走插件的用例数（destroy 直写 Redis，不产生插件回复）
         expect = len(plugin_cases)
