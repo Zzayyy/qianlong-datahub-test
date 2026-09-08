@@ -120,11 +120,15 @@ def expand(v):
     动态条件单号（日期+顺序号，发送时才展开）：
       __REF3__      -> 单个，如 20260907000003
       __REF1_10__   -> 范围，展开成逗号分隔的 1~10 号（配合 set/remove 的 Refs 列）
+    动态日期：
+      __TODAY__     -> 发送当天 YYYY-MM-DD（query 的"当日"窗口，Excel 无需每天重生成）
     其余 token 查 TOKEN_MAP。
     """
     if v is None:
         return None
     s = str(v).strip()
+    if s == "__TODAY__":
+        return time.strftime("%Y-%m-%d")
     if s in TOKEN_MAP:
         return TOKEN_MAP[s]
     m = _REF_TOKEN_RE.fullmatch(s)

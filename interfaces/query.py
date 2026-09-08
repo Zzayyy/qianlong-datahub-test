@@ -75,7 +75,7 @@ ROWS = [
     ("Q005", "normal", "二季度",                 "0", 7, 6, FACCOUNT, "2026-04-01", "2026-06-30", "期望 Err>=0 返回条件单列表"),
     ("Q006", "normal", "三季度",                 "0", 7, 6, FACCOUNT, "2026-07-01", "2026-09-30", "期望 Err>=0 返回条件单列表"),
     ("Q007", "normal", "四季度",                 "0", 7, 6, FACCOUNT, "2026-10-01", "2026-12-31", "期望 Err>=0 返回条件单列表"),
-    ("Q008", "normal", "当月",                   "0", 7, 6, FACCOUNT, "2026-09-01", "2026-09-30", "期望 Err>=0 返回条件单列表"),
+    ("Q008", "normal", "当日(发送当天)",         "0", 7, 6, FACCOUNT, "__TODAY__", "__TODAY__", "当日窗口：命中当天 create 造的单（Begin=End=__TODAY__，发送时展开当天）"),
     ("Q009", "normal", "两个月窗口",             "0", 7, 6, FACCOUNT, "2026-08-01", "2026-09-30", "期望 Err>=0 返回条件单列表"),
     ("Q010", "normal", "滚动一年(跨年)",         "0", 7, 6, FACCOUNT, "2025-10-01", "2026-09-30", "期望 Err>=0 返回条件单列表"),
     # ---------- probe：兼容性探测，结果不确定，不计入压测指标 ----------
@@ -163,7 +163,7 @@ def build_payload(row: dict) -> dict:
         account["FAccount"] = str(faccount)
     payload = {"query": {"Account": account}}
     for fld in ("BeginDate", "EndDate"):
-        v = row.get(fld)
+        v = _expand(row.get(fld))   # 支持 __TODAY__ 等动态日期，展开成发送当天
         if v is not None and str(v).strip() != "":
             payload["query"][fld] = str(v)
     return payload
