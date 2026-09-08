@@ -680,9 +680,7 @@ class MainWindow(QWidget):
         self.chk_type_normal = QCheckBox("normal")
         self.chk_type_error = QCheckBox("error")
         self.chk_type_destroy = QCheckBox("destroy")
-        self.chk_type_normal.setChecked(True)
-        self.chk_type_error.setChecked(True)
-        self.chk_type_destroy.setChecked(True)
+        # 默认全不勾选：压测/破坏分开展，避免误发 destroy 直写 Redis
         for cb in (self.chk_type_normal, self.chk_type_error, self.chk_type_destroy):
             type_box.addWidget(cb)
         type_box.addStretch(1)
