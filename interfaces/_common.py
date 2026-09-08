@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """接口定义的公共辅助工具"""
+import datetime
 import re
 import time
 
@@ -120,8 +121,12 @@ def expand(v):
     动态条件单号（日期+顺序号，发送时才展开）：
       __REF3__      -> 单个，如 20260907000003
       __REF1_10__   -> 范围，展开成逗号分隔的 1~10 号（配合 set/remove 的 Refs 列）
-    动态日期：
-      __TODAY__     -> 发送当天 YYYY-MM-DD（query 的"当日"窗口，Excel 无需每天重生成）
+    动态日期（发送当天所在日/月/年）：
+      __TODAY__       -> 发送当天 YYYY-MM-DD（query 的"当日"窗口）
+      __MONTH_START__ -> 当月首日 YYYY-MM-01
+      __MONTH_END__   -> 当月末日
+      __YEAR_START__  -> 当年 01-01
+      __YEAR_END__    -> 当年 12-31
     其余 token 查 TOKEN_MAP。
     """
     if v is None:
@@ -129,6 +134,16 @@ def expand(v):
     s = str(v).strip()
     if s == "__TODAY__":
         return time.strftime("%Y-%m-%d")
+    if s == "__MONTH_START__":
+        return time.strftime("%Y-%m-01")
+    if s == "__MONTH_END__":
+        today = datetime.date.today()
+        nxt = (today.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+        return (nxt - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    if s == "__YEAR_START__":
+        return time.strftime("%Y-01-01")
+    if s == "__YEAR_END__":
+        return time.strftime("%Y-12-31")
     if s in TOKEN_MAP:
         return TOKEN_MAP[s]
     m = _REF_TOKEN_RE.fullmatch(s)

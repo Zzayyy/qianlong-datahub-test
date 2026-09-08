@@ -620,7 +620,7 @@ class MainWindow(QWidget):
         self.spin_bulk_accounts.setRange(0, 1000000)
         self.spin_bulk_accounts.setValue(int(self.cfg.get("bulk_accounts", "0")))
         self.spin_bulk_accounts.setToolTip(
-            "为 acc_sign / create 生成 N 行正常数据、每行一个不同账号"
+            "为 acc_sign / create / query 生成 N 行正常数据、每行一个不同账号"
             "（配合性能测试真实数据、不循环）；0=不启用")
         bulk_row.addWidget(self.spin_bulk_accounts)
         bulk_row.addWidget(QLabel("起始序号:"))
@@ -692,7 +692,8 @@ class MainWindow(QWidget):
         # 行1：等待回复 / 安静模式
         g2.addWidget(QLabel("等待回复秒数:"), 1, 0)
         self.spin_wait = QDoubleSpinBox()
-        self.spin_wait.setRange(0, 300)
+        # 等待回复不限 300s：支持到一天（86400s），足够长压测收齐回复
+        self.spin_wait.setRange(0, 86400)
         self.spin_wait.setValue(float(self.cfg.get("wait", "5.0")))
         g2.addWidget(self.spin_wait, 1, 1)
 
@@ -1277,8 +1278,8 @@ class MainWindow(QWidget):
             # 引用单号区间只对含云单引用的接口生效（create 是造单方，query 无引用）
             if ref_spec and n in ("set", "modify", "remove"):
                 cmd += ["--ref-spec", ref_spec]
-            # 批量正常账号：只对实现了 build_bulk_rows 的接口生效（当前 acc_sign / create）
-            if bulk_n and n in ("acc_sign", "create"):
+            # 批量正常账号：只对实现了 build_bulk_rows 的接口生效（acc_sign / create / query）
+            if bulk_n and n in ("acc_sign", "create", "query"):
                 cmd += ["--bulk-normal", str(bulk_n),
                         "--bulk-start", str(self.spin_bulk_start.value())]
             cmds.append(cmd)

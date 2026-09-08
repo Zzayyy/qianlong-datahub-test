@@ -21,7 +21,8 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (expand, gen_account_variety, gen_fuzz, gen_cross,
-                     STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL)
+                     STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL,
+                     ACCOUNT_START, fmt_account)
 
 NAME = "query"
 TITLE = "查询云条件单(query)"
@@ -139,6 +140,42 @@ _ROWS_BULK += gen_cross(HEADERS, ROWS[0], accounts=REAL_ACCOUNT_POOL, injects=[
     ("BeginDate", "__DATE_13__"), ("EndDate", "__DATE_FAR__"),
 ], type_tag="destroy", start=300)
 ROWS = ROWS + _ROWS_BULK
+
+# ==================== 批量账号查询生成（性能测试：N 行不循环）====================
+# 数据形态：10000 个账号各建 1 张单（create 批量）。query 每行查一个不同账号，
+# 日期窗口在"当日/当月/当年"间轮换——三者都必然包含建单那天，保证每行查得到数据。
+_BULK_WINDS = [
+    ("当日", "__TODAY__", "__TODAY__"),
+    ("当月", "__MONTH_START__", "__MONTH_END__"),
+    ("当年", "__YEAR_START__", "__YEAR_END__"),
+]
+
+
+def build_bulk_rows(count, start=0):
+    """生成 count 行 normal：每行一个不同账号 + 命中窗口轮换（当日/当月/当年）。
+
+    前提：账号已 acc_sign 批量签署、且当天用 create 批量建过单；
+    start 与 acc_sign/create 同号段（默认 _common.ACCOUNT_START=11301）。
+    """
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    if start + count - 1 > 999999:
+        raise ValueError(f"账号序号 {start + count - 1} 超出 6 位上限 999999")
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        name, b, e = _BULK_WINDS[i % len(_BULK_WINDS)]
+        out.append((
+            f"QG{i + 1:04d}", "normal",
+            f"账号{facct} 查询({name})",
+            0, 7, 6, facct, b, e,
+            "批量账号查询：窗口必含创建日",
+        ))
+    return out
+
 
 # ==================== 报文构造 ====================
 _INT_FIELDS = ("Model", "AccountType", "AccAtt")
