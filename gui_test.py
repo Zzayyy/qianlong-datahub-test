@@ -396,6 +396,7 @@ DEFAULT_CONFIG = {
     "destroy_via_plugin": "0",
     "destroy_mode": "mixed",
     "download": "1",
+    "auto_export": "0",  # 批量完成后自动保存汇总 Excel（0=只显示，需时手动导出）
     "download_dir": "out/performance",
     "remote": "1",       # 启用远程执行
     "quiet": "1",        # 安静模式
@@ -884,6 +885,12 @@ class MainWindow(QWidget):
         self.lbl_summary_info = QLabel("批量发送完成后自动汇总")
         self.lbl_summary_info.setStyleSheet("color: #666;")
         top5.addWidget(self.lbl_summary_info)
+        self.chk_auto_export = QCheckBox("批量完成后自动保存汇总 Excel")
+        self.chk_auto_export.setChecked(self.cfg.get("auto_export", "0") == "1")
+        self.chk_auto_export.setToolTip(
+            "勾选：本次批量发送全部完成后，自动把汇总表导出为 out/performance/批量汇总_时间.xlsx；\n"
+            "不勾选：只刷新汇总表格显示，需要留存时手动点\"导出 Excel\"")
+        top5.addWidget(self.chk_auto_export)
         top5.addStretch(1)
         self.btn_summary_refresh = QPushButton("刷新汇总")
         self.btn_summary_refresh.clicked.connect(self._refresh_summary)
@@ -1345,6 +1352,7 @@ class MainWindow(QWidget):
             "destroy_mode": self.combo_destroy_mode.currentData() or "mixed",
             "remote": "1" if self.chk_remote.isChecked() else "0",
             "download": "1" if self.chk_download.isChecked() else "0",
+            "auto_export": "1" if self.chk_auto_export.isChecked() else "0",
             "box_redis": "1" if self.box_redis.isExpanded() else "0",
             "box_linux": "1" if self.box_linux.isExpanded() else "0",
             "box_out": "1" if self.box_out.isExpanded() else "0",
@@ -1514,7 +1522,8 @@ class MainWindow(QWidget):
         idx = self._batch_idx
         if idx >= len(names):
             self.append_log(f"[BATCH] 全部完成（共 {len(names)} 个接口）")
-            self._auto_export = True
+            # 自动保存汇总总表：仅当界面勾选了"批量完成后自动保存汇总 Excel"
+            self._auto_export = self.chk_auto_export.isChecked()
             self.tabs.setCurrentWidget(self.tab_summary)   # 跑完直接看汇总
             self._refresh_summary()   # 汇总分析始终刷新（stats JSON 始终下载）
             self.set_running(False)
