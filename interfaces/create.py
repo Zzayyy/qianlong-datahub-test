@@ -26,6 +26,7 @@ from _common import (expand, build_account, to_typed, REAL_ACCOUNT, REAL_VALID_D
                      REAL_COND_LOSS, REAL_COND_PROFIT,
                      REAL_COND_TARGET_LOSS, REAL_COND_TARGET_PROFIT,
                      STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL,
+                     ACCOUNT_PREFIX, ACCOUNT_START, fmt_account,
                      gen_account_variety, gen_fuzz, gen_cross)
 
 NAME = "create"
@@ -309,6 +310,44 @@ _ROWS_BULK += gen_cross(HEADERS, ROWS[0], accounts=REAL_ACCOUNT_POOL, injects=[
     ("Entrust_ExchangeNum", 99), ("CondPrice_TriggerPrice", "__PRICE_NEG__"),
 ], type_tag="destroy", start=300)
 ROWS = ROWS + _ROWS_BULK
+
+# ==================== 批量真实条件单生成（性能测试：N 条正常数据，不循环）====================
+# 每行一个不同账号（与 acc_sign 同一号段，账号须先批量签出）+ 5 类云单轮流，
+# 10000 行 = 10000 张单分布在各账号上、类型均匀覆盖，无需按类型 ×N。
+
+
+def build_bulk_rows(count, start=0):
+    """生成 count 行 normal（每行一个不同账号、CondType 五类轮换），供 make_excel --bulk-normal 使用。
+
+    start: 账号 6 位序号起点（默认 _common.ACCOUNT_START=11301，与 acc_sign 同一批号）。
+    """
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    if start + count - 1 > 999999:
+        raise ValueError(f"账号序号 {start + count - 1} 超出 6 位上限 999999")
+    keys = [k for k, _ in HEADERS]
+    idx = {k: i for i, k in enumerate(keys)}
+    # 5 类云单的 normal 模板 = ROWS 里前 5 个 normal 行（C001~C005）
+    templates = [r for r in ROWS
+                 if isinstance(r, (list, tuple)) and len(r) == len(keys)
+                 and str(r[idx["case_type"]]) == "normal"][:5]
+    if len(templates) < 5:
+        raise ValueError("ROWS 中 normal 模板不足 5 类（价格/时间/幅度/合约止盈损/标的止盈损）")
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        r = list(templates[i % 5])
+        r[idx["case_no"]] = f"CG{i + 1:04d}"
+        r[idx["case_type"]] = "normal"
+        r[idx["case_desc"]] = f"账号{facct} {i % 5 + 1}类云单(压测)"
+        r[idx["FAccount"]] = facct
+        r[idx["CondName"]] = f"name{i + 1}"
+        r[idx["CondDesc"]] = f"压测账号{seq}第{i % 5 + 1}类"
+        out.append(tuple(r))
+    return out
 
 
 def build_payload(row: dict) -> dict:

@@ -138,6 +138,11 @@ def main():
                          "生成的引用行（每行引用一个号，便于配合 create 造的批单做压测）。"
                          "格式：起始[,条数]  或  起始-结束；起始可填完整单号(YYYYMMDD+6位)或纯序号"
                          "（日期取发送当天，Excel 存 __REFn__ token）。例：7,100 或 20260904000001-20260904000100")
+    ap.add_argument("--bulk-normal", type=int, default=0,
+                    help="仅对实现了 build_bulk_rows 的接口(如 acc_sign)生效：把 normal 段替换为"
+                         "N 行账号各不相同的正常数据（性能测试真实数据、不循环）。例：--bulk-normal 10000")
+    ap.add_argument("--bulk-start", type=int, default=0,
+                    help="批量账号起始序号（0=取接口默认，acc_sign 默认 011301 避开已签真实账号）")
     args = ap.parse_args()
 
     mod = load_interface(args.interface)
@@ -156,6 +161,25 @@ def main():
         start, count = _parse_ref_spec(args.ref_spec)
         print(f"[OK] {mod.NAME}: normal 段已替换为 {len(extra)} 行，"
               f"引用第 {start}~{start + len(extra) - 1} 号（发送时按当天展开）")
+
+    # ---- 批量正常账号：替换 normal 为 N 行各不相同的账号数据 ----
+    if args.bulk_normal:
+        if args.ref_spec:
+            sys.exit("[FAIL] --ref-spec 与 --bulk-normal 互斥，不能同时使用")
+        fn = getattr(mod, "build_bulk_rows", None)
+        if not callable(fn):
+            sys.exit(f"[FAIL] 接口 {mod.NAME} 未实现 build_bulk_rows(count, start)，不支持 --bulk-normal")
+        try:
+            extra = fn(args.bulk_normal, args.bulk_start)
+        except Exception as e:
+            sys.exit(f"[FAIL] 接口 {mod.NAME} --bulk-normal: {e}")
+        keys = [k for k, _ in mod.HEADERS]
+        type_i = keys.index("case_type")
+        kept = [r for r in mod.ROWS
+                if not (isinstance(r, (list, tuple)) and str(r[type_i]) == "normal")]
+        mod.ROWS = list(extra) + list(kept)
+        print(f"[OK] {mod.NAME}: normal 段已替换为 {len(extra)} 行不同账号"
+              + (f"（起始序号 {args.bulk_start}）" if args.bulk_start else ""))
 
     os.makedirs(DATA_DIR, exist_ok=True)
     out = os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")

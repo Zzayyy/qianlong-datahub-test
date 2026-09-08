@@ -401,6 +401,8 @@ DEFAULT_CONFIG = {
     "quiet": "1",        # 安静模式
     "cases": "",         # 用例编号筛选（空=全部）
     "ref_spec": "",      # set/modify/remove 生成 Excel 的引用单号区间（空=默认 normal 行）
+    "bulk_accounts": "0",  # acc_sign 批量账号行数（N 行不同账号的正常数据；0=不启用）
+    "bulk_start": "0",     # 批量账号起始序号（0=接口默认 011301）
     "preview": "0",      # 预览模式（--no-send，只生成报文不发送）
     "box_redis": "1",    # 右侧三个标题条的展开状态
     "box_linux": "1",
@@ -610,6 +612,24 @@ class MainWindow(QWidget):
             "生成这三个表后发送即可一一对应。")
         ref_row.addWidget(self.edit_ref, 1)
         right.addLayout(ref_row)
+        # 批量正常账号：acc_sign 等实现 build_bulk_rows 的接口，生成 N 行不同账号数据（压测不循环）
+        bulk_row = QHBoxLayout()
+        bulk_row.addWidget(QLabel("批量账号:"))
+        self.spin_bulk_accounts = QSpinBox()
+        self.spin_bulk_accounts.setRange(0, 1000000)
+        self.spin_bulk_accounts.setValue(int(self.cfg.get("bulk_accounts", "0")))
+        self.spin_bulk_accounts.setToolTip(
+            "为 acc_sign / create 生成 N 行正常数据、每行一个不同账号"
+            "（配合性能测试真实数据、不循环）；0=不启用")
+        bulk_row.addWidget(self.spin_bulk_accounts)
+        bulk_row.addWidget(QLabel("起始序号:"))
+        self.spin_bulk_start = QSpinBox()
+        self.spin_bulk_start.setRange(0, 999999)
+        self.spin_bulk_start.setValue(int(self.cfg.get("bulk_start", "0")))
+        self.spin_bulk_start.setToolTip(
+            "账号 6 位序号起点；0=接口默认（acc_sign 为 011301，紧邻已签真实账号 010100011300 之后）")
+        bulk_row.addWidget(self.spin_bulk_start)
+        right.addLayout(bulk_row)
         rows = max((len(names) + cols - 1) // cols, 1)
         g1.addLayout(right, 0, cols, rows, 1)
         left_lay.addWidget(grp1)
@@ -1243,12 +1263,17 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "提示", "请至少勾选一个接口")
             return
         ref_spec = self.edit_ref.text().strip()
+        bulk_n = self.spin_bulk_accounts.value()
         cmds = []
         for n in names:
             cmd = [PYTHON, os.path.join(BASE_DIR, "make_excel.py"), "--interface", n]
             # 引用单号区间只对含云单引用的接口生效（create 是造单方，query 无引用）
             if ref_spec and n in ("set", "modify", "remove"):
                 cmd += ["--ref-spec", ref_spec]
+            # 批量正常账号：只对实现了 build_bulk_rows 的接口生效（当前 acc_sign / create）
+            if bulk_n and n in ("acc_sign", "create"):
+                cmd += ["--bulk-normal", str(bulk_n),
+                        "--bulk-start", str(self.spin_bulk_start.value())]
             cmds.append(cmd)
         self.run_local(cmds, on_done=lambda rc: self.update_excel_label())
 
@@ -1313,6 +1338,8 @@ class MainWindow(QWidget):
             "quiet": "1" if self.chk_quiet.isChecked() else "0",
             "cases": self.edit_cases.text().strip(),
             "ref_spec": self.edit_ref.text().strip(),
+            "bulk_accounts": str(self.spin_bulk_accounts.value()),
+            "bulk_start": str(self.spin_bulk_start.value()),
             "preview": "1" if self.chk_preview.isChecked() else "0",
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
             "destroy_mode": self.combo_destroy_mode.currentData() or "mixed",

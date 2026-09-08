@@ -25,7 +25,8 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (expand, gen_account_variety, gen_fuzz, gen_cross,
-                     STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL)
+                     STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL,
+                     ACCOUNT_PREFIX, ACCOUNT_START, fmt_account)
 
 NAME = "acc_sign"
 TITLE = "云条件单账号签署(acc_sign)"
@@ -171,6 +172,40 @@ _ROWS_BULK += gen_cross(HEADERS, ROWS[0], accounts=REAL_ACCOUNT_POOL, injects=[
     ("BranchNO", "__LONG__"), ("BranchNO", "__SQL__"),
 ], type_tag="destroy", start=300)
 ROWS = ROWS + _ROWS_BULK
+
+# ==================== 批量真实账号生成（性能测试：N 条正常数据，不循环）====================
+# 账号号段共用 _common.ACCOUNT_PREFIX/ACCOUNT_START（与 create 同一批账号，先签后建）。
+
+
+def build_bulk_rows(count, start=0):
+    """生成 count 行 normal（每行一个不同账号），供 make_excel --bulk-normal 使用。
+
+    start: 账号 6 位序号起点（默认 _common.ACCOUNT_START=11301，不与真实账号 010100011300 重叠）。
+    返回与 HEADERS 等宽的完整行列表；只保证字段格式与真实样本一致。
+    """
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    if start + count - 1 > 999999:
+        raise ValueError(f"账号序号 {start + count - 1} 超出 6 位上限 999999")
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        # 股东号按真实样本格式编：沪 "A"+8位数字，深 10位数字(0 开头)
+        sh1 = "A" + f"{44200000 + seq:08d}"
+        sh2 = f"{199000000 + seq:010d}"
+        out.append((
+            f"AG{i + 1:04d}", "normal",
+            f"真实号段账号 签署({facct})",
+            0, 7, 6, facct,
+            "123123", "123456", f"压测客户{seq}", facct,
+            sh1, 1, sh2, 2,
+            "批量正常账号：每行唯一，配合性能测试不循环",
+        ))
+    return out
+
 
 # ==================== 报文构造 ====================
 # 破坏测试 token 统一由 _common.TOKEN_MAP 提供；保留 _expand 别名给 build_payload

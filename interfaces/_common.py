@@ -276,6 +276,17 @@ REAL_COND_TARGET_PROFIT = {"StockCode": "510050", "ExchangeNum": 1, "Method": 1,
                            "Withdraw": "0.50"}
 REAL_VALID_DATE = "2026-12-31"   # 云单到期日期（doc 样本 2026-08-31 已过期，顺延到年末）
 
+# ==================== 批量真实测试账号号段（acc_sign / create 等 make_excel --bulk-normal 共用）====================
+# 真实账号 010100011300 = 前缀 010100 + 6 位序号 011300。
+# 批量账号从 ACCOUNT_START 起递增（默认紧邻真实已签账号之后），只保证格式与真实样本一致。
+ACCOUNT_PREFIX = "010100"      # 12 位云单账号的前 6 位固定前缀
+ACCOUNT_START = 11301          # 默认起始序号：紧邻真实账号 010100011300 之后
+
+
+def fmt_account(seq):
+    """把 6 位序号格式化成云单账号（ACCOUNT_PREFIX + 6位序号）。"""
+    return f"{ACCOUNT_PREFIX}{int(seq):06d}"
+
 # ==================== 账号池：按用途严格分成两个，禁止混用 ====================
 # 用例类型约定（四个，各司其职）：
 #   normal  - 压测数据：账号四要素必须与真实账号完全匹配，业务字段完整合法。
