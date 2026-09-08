@@ -400,6 +400,7 @@ DEFAULT_CONFIG = {
     "remote": "1",       # 启用远程执行
     "quiet": "1",        # 安静模式
     "cases": "",         # 用例编号筛选（空=全部）
+    "ref_spec": "",      # set/modify/remove 生成 Excel 的引用单号区间（空=默认 normal 行）
     "preview": "0",      # 预览模式（--no-send，只生成报文不发送）
     "box_redis": "1",    # 右侧三个标题条的展开状态
     "box_linux": "1",
@@ -596,6 +597,19 @@ class MainWindow(QWidget):
         self.btn_make = QPushButton("批量生成 Excel")
         self.btn_make.clicked.connect(self.on_make)
         right.addWidget(self.btn_make)
+        # 引用单号区间：仅勾选了 set/modify/remove 时生效，把这三个表的 normal 行
+        # 替换为逐行引用不同单号的压测行（配合 create 造的批单）
+        ref_row = QHBoxLayout()
+        self.edit_ref = QLineEdit(self.cfg.get("ref_spec", ""))
+        self.edit_ref.setPlaceholderText("引用单号: 如 7,100 或 20260904000001-20260904000100")
+        self.edit_ref.setToolTip(
+            "为 set/modify/remove 生成 Excel 时按云单号区间生成 normal 行（每行引用一个号）：\n"
+            "· 起始[,条数]：如 20260904000001,100（第1~100号）或 7,100\n"
+            "· 起始-结束：如 20260904000001-20260904000100\n"
+            "先跑 create（max=100）造出批单，再把本框填成 create 实际返回的起始号+条数，"
+            "生成这三个表后发送即可一一对应。")
+        ref_row.addWidget(self.edit_ref, 1)
+        right.addLayout(ref_row)
         rows = max((len(names) + cols - 1) // cols, 1)
         g1.addLayout(right, 0, cols, rows, 1)
         left_lay.addWidget(grp1)
@@ -1228,8 +1242,14 @@ class MainWindow(QWidget):
         if not names:
             QMessageBox.warning(self, "提示", "请至少勾选一个接口")
             return
-        cmds = [[PYTHON, os.path.join(BASE_DIR, "make_excel.py"), "--interface", n]
-                for n in names]
+        ref_spec = self.edit_ref.text().strip()
+        cmds = []
+        for n in names:
+            cmd = [PYTHON, os.path.join(BASE_DIR, "make_excel.py"), "--interface", n]
+            # 引用单号区间只对含云单引用的接口生效（create 是造单方，query 无引用）
+            if ref_spec and n in ("set", "modify", "remove"):
+                cmd += ["--ref-spec", ref_spec]
+            cmds.append(cmd)
         self.run_local(cmds, on_done=lambda rc: self.update_excel_label())
 
     def selected_types(self):
@@ -1292,6 +1312,7 @@ class MainWindow(QWidget):
             "mock": "1" if self.chk_mock.isChecked() else "0",
             "quiet": "1" if self.chk_quiet.isChecked() else "0",
             "cases": self.edit_cases.text().strip(),
+            "ref_spec": self.edit_ref.text().strip(),
             "preview": "1" if self.chk_preview.isChecked() else "0",
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
             "destroy_mode": self.combo_destroy_mode.currentData() or "mixed",

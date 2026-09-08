@@ -24,6 +24,9 @@ import create as _create
 NAME = "modify"
 TITLE = "修改云条件单(modify)"
 
+# make_excel --ref-spec 依赖此列名：按云单号区间生成 normal 引用行
+REF_KEY = "Ref"
+
 FACCOUNT = REAL_ACCOUNT["FAccount"]
 REF1 = "__REF1__"
 

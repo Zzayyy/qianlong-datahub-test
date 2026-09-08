@@ -25,6 +25,9 @@ from _common import (expand, build_account, to_typed, REAL_ACCOUNT, FAKE_REF,
 NAME = "set"
 TITLE = "运行/停止云条件单(set)"
 
+# make_excel --ref-spec 依赖此列名：按云单号区间生成 normal 引用行
+REF_KEY = "Refs"
+
 FACCOUNT = REAL_ACCOUNT["FAccount"]
 REF1, REF2 = "__REF1__", "__REF2__"
 
