@@ -83,6 +83,33 @@ def _parse_ref_spec(spec):
     raise ValueError("格式应为 起始[,条数] 或 起始-结束，如 7,100 或 7-106")
 
 
+def load_ref_map(path):
+    """读 send_test 落盘的 create 回填 JSON，转成 {账号: Ref}。"""
+    import json
+    with open(path, encoding="utf-8") as f:
+        rows = json.load(f)
+    return {str(r.get("account")): str(r.get("ref"))
+            for r in rows if r.get("account") and r.get("ref")}
+
+
+def apply_ref_map(rows, fa_i, ref_i, refmap):
+    """把行内账号对应的真实 Ref（静态完整号）写进 Ref(s) 列；未命中保留原 token。"""
+    out = []
+    miss = 0
+    for r in rows:
+        row = list(r)
+        acct = str(row[fa_i]) if fa_i is not None else ""
+        ref = refmap.get(acct)
+        if ref:
+            row[ref_i] = ref
+        else:
+            miss += 1
+        out.append(tuple(row))
+    if miss:
+        print(f"[WARN] {miss} 行账号未在回填映射中，保留原 __REF__ token")
+    return out
+
+
 def build_ref_rows(mod, spec):
     """对 set/modify/remove 按区间生成 normal 引用行（每行引用一个单号）。
 
@@ -143,6 +170,13 @@ def main():
                          "N 行账号各不相同的正常数据（性能测试真实数据、不循环）。例：--bulk-normal 10000")
     ap.add_argument("--bulk-start", type=int, default=0,
                     help="批量账号起始序号（0=取接口默认，acc_sign 默认 011301 避开已签真实账号）")
+    ap.add_argument("--ref-seq", type=int, default=1,
+                    help="账号维度批量(set/modify/remove)引用的当天全局起始单号（默认 1；"
+                         "Ref 按天全局递增，当日此前已建 ref_seq-1 张时传 ref_seq，"
+                         "第 i 行引用 __REF{ref_seq+i}__，与 create 行序对齐）")
+    ap.add_argument("--ref-map", default="",
+                    help="彻底稳回填：传入 create 返回 Ref 的落盘 JSON（账号→Ref 映射），"
+                         "set/modify/remove 批量行的 Ref 用真实单号静态填回，不再依赖顺序假设")
     args = ap.parse_args()
 
     mod = load_interface(args.interface)
@@ -170,10 +204,22 @@ def main():
         if not callable(fn):
             sys.exit(f"[FAIL] 接口 {mod.NAME} 未实现 build_bulk_rows(count, start)，不支持 --bulk-normal")
         try:
-            extra = fn(args.bulk_normal, args.bulk_start)
+            # 支持第三参 ref_seq（set/modify/remove 账号维度）；旧接口只有两参会自动回退
+            try:
+                extra = fn(args.bulk_normal, args.bulk_start, args.ref_seq)
+            except TypeError:
+                extra = fn(args.bulk_normal, args.bulk_start)
         except Exception as e:
             sys.exit(f"[FAIL] 接口 {mod.NAME} --bulk-normal: {e}")
         keys = [k for k, _ in mod.HEADERS]
+        # 彻底稳回填：用 create 实际返回的账号→Ref 覆盖生成的 __REF token
+        if args.ref_map:
+            ref_key = getattr(mod, "REF_KEY", "")
+            if not ref_key or "FAccount" not in keys:
+                sys.exit(f"[FAIL] 接口 {mod.NAME} 无 REF_KEY/FAccount，不支持 --ref-map")
+            extra = apply_ref_map(extra, keys.index("FAccount"), keys.index(ref_key),
+                                  load_ref_map(args.ref_map))
+            print(f"[OK] {mod.NAME}: 已用 --ref-map 回填真实 Ref")
         type_i = keys.index("case_type")
         kept = [r for r in mod.ROWS
                 if not (isinstance(r, (list, tuple)) and str(r[type_i]) == "normal")]

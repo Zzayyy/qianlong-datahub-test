@@ -415,6 +415,7 @@ DEFAULT_CONFIG = {
     "download": "1",
     "auto_export": "0",  # 批量完成后自动保存汇总 Excel（0=只显示，需时手动导出）
     "summary_expand": "0",  # 多进程运行汇总按进程展开显示（1=每进程一行，0=仅全局一行）
+    "ref_map": "",       # create 返回 Ref 回填文件（_refs.json），set/modify/remove 生成时填真实单号
     "download_dir": "out/performance",
     "remote": "1",       # 启用远程执行
     "quiet": "1",        # 安静模式
@@ -640,8 +641,9 @@ class MainWindow(QWidget):
         self.spin_bulk_accounts.setRange(0, 1000000)
         self.spin_bulk_accounts.setValue(int(self.cfg.get("bulk_accounts", "0")))
         self.spin_bulk_accounts.setToolTip(
-            "为 acc_sign / create / query 生成 N 行正常数据、每行一个不同账号"
-            "（配合性能测试真实数据、不循环）；0=不启用")
+            "为 acc_sign / acc_query / create / query / set / modify / remove 生成 N 行正常数据、"
+            "每行一个不同账号；set/modify/remove 第 i 行引用当天全局第 i 号单 __REF{i}__"
+            "（与 create 行序一一对应，需 create 按行顺序发送）；0=不启用")
         bulk_row.addWidget(self.spin_bulk_accounts)
         bulk_row.addWidget(QLabel("起始序号:"))
         self.spin_bulk_start = QSpinBox()
@@ -651,6 +653,18 @@ class MainWindow(QWidget):
             "账号 6 位序号起点；0=接口默认（acc_sign 为 011301，紧邻已签真实账号 010100011300 之后）")
         bulk_row.addWidget(self.spin_bulk_start)
         right.addLayout(bulk_row)
+        # Ref 回填文件：create 落盘的 *_refs.json（账号→真实Ref），set/modify/remove 生成时静态填回
+        refmap_row = QHBoxLayout()
+        self.edit_ref_map = QLineEdit(self.cfg.get("ref_map", ""))
+        self.edit_ref_map.setPlaceholderText("Ref回填文件 *_refs.json (可选)")
+        self.edit_ref_map.setToolTip(
+            "传 create 返回 Ref 的落盘 JSON（out/performance/*_refs.json），"
+            "生成 set/modify/remove 时按账号把 __REF token 替换成中台真实单号——彻底稳，不依赖顺序假设")
+        refmap_row.addWidget(self.edit_ref_map, 1)
+        self.btn_pick_ref_map = QPushButton("浏览…")
+        self.btn_pick_ref_map.clicked.connect(self._pick_ref_map_file)
+        refmap_row.addWidget(self.btn_pick_ref_map)
+        right.addLayout(refmap_row)
         rows = max((len(names) + cols - 1) // cols, 1)
         g1.addLayout(right, 0, cols, rows, 1)
         left_lay.addWidget(grp1)
@@ -1325,10 +1339,15 @@ class MainWindow(QWidget):
             # 引用单号区间只对含云单引用的接口生效（create 是造单方，query 无引用）
             if ref_spec and n in ("set", "modify", "remove"):
                 cmd += ["--ref-spec", ref_spec]
-            # 批量正常账号：只对实现了 build_bulk_rows 的接口生效（acc_sign / create / query）
-            if bulk_n and n in ("acc_sign", "create", "query"):
+            # 批量正常账号：只对实现了 build_bulk_rows 的接口生效
+            if bulk_n and n in ("acc_sign", "acc_query", "create", "query",
+                                "set", "modify", "remove"):
                 cmd += ["--bulk-normal", str(bulk_n),
                         "--bulk-start", str(self.spin_bulk_start.value())]
+                # Ref 回填：create 落盘的真实单号（彻底稳，仅 set/modify/remove）
+                ref_map = self.edit_ref_map.text().strip()
+                if ref_map and n in ("set", "modify", "remove"):
+                    cmd += ["--ref-map", ref_map]
             cmds.append(cmd)
         self.run_local(cmds, on_done=lambda rc: self.update_excel_label())
 
@@ -1374,6 +1393,14 @@ class MainWindow(QWidget):
             parts.append(dm)
         return " ".join(parts)
 
+    def _pick_ref_map_file(self):
+        """浏览选择 create 返回 Ref 的回填 JSON。"""
+        cur = self.edit_ref_map.text().strip() or os.path.join(BASE_DIR, "out", "performance")
+        d, _ = QFileDialog.getOpenFileName(self, "选择 create 回填 JSON (*_refs.json)",
+                                           cur, "JSON (*.json)")
+        if d:
+            self.edit_ref_map.setText(d)
+
     def _save_ui_config(self):
         """把当前界面上的配置保存到 config.ini（基于已有配置增量更新，避免覆盖 Redis 等项）"""
         cfg = load_config()
@@ -1404,6 +1431,7 @@ class MainWindow(QWidget):
             "download": "1" if self.chk_download.isChecked() else "0",
             "auto_export": "1" if self.chk_auto_export.isChecked() else "0",
             "summary_expand": "1" if self.chk_summary_expand.isChecked() else "0",
+            "ref_map": self.edit_ref_map.text().strip(),
             "box_redis": "1" if self.box_redis.isExpanded() else "0",
             "box_linux": "1" if self.box_linux.isExpanded() else "0",
             "box_out": "1" if self.box_out.isExpanded() else "0",

@@ -20,6 +20,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (expand, build_account, to_typed, REAL_ACCOUNT, FAKE_REF,
                      STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL,
+                     ACCOUNT_START, fmt_account,
                      gen_account_variety, gen_fuzz, gen_cross)
 
 NAME = "set"
@@ -91,6 +92,41 @@ _ROWS_BULK += gen_cross(HEADERS, ROWS[0], accounts=REAL_ACCOUNT_POOL, injects=[
     ("Mode", 99), ("FAccount", "__CTRL__"), ("AccountType", "__HUGE__"),
 ], type_tag="destroy", start=300)
 ROWS = ROWS + _ROWS_BULK
+
+# ==================== 账号维度批量生成（配合 acc_sign/create）====================
+# Ref 为当天全局连续序号：create 批量第 i 行（账号 seq）建出的单=当天第 i 号
+# （需 create 按行顺序发送，服务端按到达顺序分配）。因此本表第 i 行引用 __REF{i}__。
+# ref_seq 语义：当天全局起始号（当日此前已有 ref_seq-1 张单时传入 ref_seq）。
+
+
+def build_bulk_rows(count, start=0, ref_seq=1):
+    """生成 count 行 normal：每行一个不同账号 + Mode 停止/运行交替，
+    引用与 create 行序对齐的全局单号 __REF{ref_seq+i}__。"""
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    ref_seq = max(1, int(ref_seq))
+    if start + count - 1 > 999999:
+        raise ValueError(f"账号序号 {start + count - 1} 超出 6 位上限 999999")
+    keys = [k for k, _ in HEADERS]
+    idx = {k: i for i, k in enumerate(keys)}
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        r = [""] * len(keys)
+        r[idx["case_no"]] = f"SG{i + 1:04d}"
+        r[idx["case_type"]] = "normal"
+        r[idx["case_desc"]] = f"账号{facct} 启停单号{ref_seq + i}"
+        r[idx["Model"]] = 0
+        r[idx["AccountType"]] = 7
+        r[idx["AccAtt"]] = 6
+        r[idx["FAccount"]] = facct
+        r[idx["Mode"]] = 0 if i % 2 == 0 else 1   # 停止/运行交替，操作对象是不同账号的单
+        r[idx["Refs"]] = f"__REF{ref_seq + i}__"
+        out.append(tuple(r))
+    return out
 
 
 def build_payload(row: dict) -> dict:

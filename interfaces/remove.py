@@ -19,6 +19,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (expand, build_account, REAL_ACCOUNT, FAKE_REF,
                      STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL,
+                     ACCOUNT_START, fmt_account,
                      gen_account_variety, gen_fuzz, gen_cross)
 
 NAME = "remove"
@@ -89,6 +90,42 @@ _ROWS_BULK += gen_cross(HEADERS, ROWS[0], accounts=REAL_ACCOUNT_POOL, injects=[
     ("FAccount", "__CTRL__"), ("AccountType", "__HUGE__"),
 ], type_tag="destroy", start=300)
 ROWS = ROWS + _ROWS_BULK
+
+# ==================== 账号维度批量生成（配合 acc_sign/create）====================
+# Ref 为当天全局连续序号：create 批量第 i 行建出的单=当天第 i 号，本表第 i 行引用 __REF{i}__
+# （需 create 按行顺序发送）。ref_seq=当天全局起始号（当日已有 ref_seq-1 张时传入）。删除不可逆。
+
+
+def build_bulk_rows(count, start=0, ref_seq=1):
+    """生成 count 行 normal：每行一个不同账号，删除与 create 行序对齐的全局单号。"""
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    ref_seq = max(1, int(ref_seq))
+    if start + count - 1 > 999999:
+        raise ValueError(f"账号序号 {start + count - 1} 超出 6 位上限 999999")
+    keys = [k for k, _ in HEADERS]
+    idx = {k: i for i, k in enumerate(keys)}
+    template = None
+    for r in ROWS:
+        if isinstance(r, (list, tuple)) and len(r) == len(keys) and str(r[idx["case_type"]]) == "normal":
+            template = list(r)
+            break
+    if template is None:
+        raise ValueError("ROWS 中没有 normal 模板行")
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        r = list(template)
+        r[idx["case_no"]] = f"RGi{i + 1:04d}"
+        r[idx["case_type"]] = "normal"
+        r[idx["case_desc"]] = f"账号{facct} 删除单号{ref_seq + i}"
+        r[idx["FAccount"]] = facct
+        r[idx["Refs"]] = f"__REF{ref_seq + i}__"
+        out.append(tuple(r))
+    return out
 
 
 def build_payload(row: dict) -> dict:

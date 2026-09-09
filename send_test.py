@@ -582,6 +582,83 @@ def destroy_write_all(items, stats, batch_size=500, concurrency=4):
     return ok, time.time() - t0, "串行逐条(未安装redis库)"
 
 
+# ==================== create 返回 Ref 采集（彻底稳回填）====================
+# 中台对 create 的回复形如 {"Err":0,"Errmsg":"...","results":[{"Ref":"20260909000001"}]}。
+# 我们按 req_id 前缀(用例编号)回找发送行，把 账号-用例-Ref 落盘，供 set/modify/remove 回填。
+
+
+def _json_obj(data):
+    """容错解析回复：可能本身就是 JSON 字符串，也可能包了一层字符串。"""
+    if not data:
+        return None
+    obj = None
+    try:
+        obj = json.loads(data)
+    except Exception:
+        return None
+    for _ in range(2):
+        if isinstance(obj, str):
+            try:
+                obj = json.loads(obj)
+            except Exception:
+                break
+        else:
+            break
+    return obj if isinstance(obj, dict) else None
+
+
+def collect_create_refs(replies, cases):
+    """从插件回复里提取 create 返回的 Ref，按用例编号关联账号。
+    返回 [{account, case_no, ref}, ...]（仅成功的）。"""
+    by_no = {}
+    for c in cases:
+        if isinstance(c, dict):
+            by_no[str(c.get("_no", ""))] = c
+    seen = {}
+    for rid, data in replies:
+        if not rid or not data:
+            continue
+        key = rid.rsplit("_", 1)[0] if "_" in rid else rid
+        c = by_no.get(key)
+        if not c:
+            continue
+        obj = _json_obj(data)
+        if not obj:
+            continue
+        results = obj.get("results")
+        if not isinstance(results, list):
+            results = obj.get("Results")
+        if not isinstance(results, list):
+            results = [obj]
+        ref = None
+        for it in results:
+            if isinstance(it, dict) and it.get("Ref"):
+                ref = str(it["Ref"])
+                break
+        if not ref:
+            continue
+        seen[key] = {"account": str(c.get("FAccount", "")),
+                     "case_no": key, "ref": ref}
+    return list(seen.values())
+
+
+def save_refs_file(ref_rows, stats_dir, name, ts=None, tag=""):
+    """把账号-Ref 映射写 JSON。返回路径或 None（无业务 Ref）。"""
+    if not ref_rows:
+        return None
+    os.makedirs(stats_dir, exist_ok=True)
+    ts = ts or time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(stats_dir, f"{name}{tag}_{ts}_refs.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(ref_rows, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def load_refs_map(ref_rows):
+    """把 ref_rows 变成 {account: ref}，用于 make_excel --ref-map。"""
+    return {r["account"]: r["ref"] for r in ref_rows if r.get("account") and r.get("ref")}
+
+
 # ==================== 多进程并行发送（--procs N，Linux）====================
 # 原理：把 Excel 数据行按行号均分成 N 段，每段起一个子进程 send_test（--procs 1），
 # 子进程各自 CreateMQ/插件连接/独立 mock，突破单连接吞吐瓶颈；
@@ -704,7 +781,8 @@ def run_multi_procs(args, mod, excel, total_rows):
     # 清掉 proc 目录历史 JSON，避免合并时把历次运行的文件也算进去
     for d in proc_dirs:
         if os.path.isdir(d):
-            for f in _gl.glob(os.path.join(d, "*_stats.json")):
+            for f in _gl.glob(os.path.join(d, "*_stats.json")) + \
+                    _gl.glob(os.path.join(d, "*_refs.json")):
                 os.remove(f)
     children = []
     for i, (a, b) in enumerate(ranges):
@@ -733,6 +811,23 @@ def run_multi_procs(args, mod, excel, total_rows):
         sys.stdout.flush()
         os._exit(1)
     merged = _merge_summaries(merges)
+    # create：把各进程的 账号-Ref 回填结果合并成一份（按 case_no 去重）
+    if mod.NAME == "create":
+        ref_rows = []
+        for d in proc_dirs:
+            for f in _gl.glob(os.path.join(d, "*_refs.json")):
+                try:
+                    with open(f, encoding="utf-8") as fh:
+                        ref_rows.extend(json.load(fh) or [])
+                except Exception as e:
+                    print(f"[WARN] 读取回填文件 {f} 失败: {e}")
+        if ref_rows:
+            dedup = {r["case_no"]: r for r in ref_rows if r.get("case_no")}.values()
+            p = save_refs_file(list(dedup), stats_root, mod.NAME)
+            if p:
+                print(f"[REFS] create 返回 Ref 已回填落盘: {p}（{len(dedup)} 条）")
+            else:
+                print("[REFS] 无 create 业务回复（mock 不答业务），未生成回填文件")
     ts = time.strftime("%Y%m%d_%H%M%S")
     path = os.path.join(stats_root, f"{mod.NAME}_{ts}_stats.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -1079,6 +1174,16 @@ def main():
         for rid, data in sample:
             _sep("reply sample")
             print(f"    req_id={rid} -> {data[:200]}")
+
+        # ---- create 回填：把中台返回的实际 Ref 落盘（真实中台才有业务回复）----
+        if mod.NAME == "create":
+            ref_rows = collect_create_refs(list(client._replies), cases)
+            refs_dir = args.stats_out or os.path.join(BASE_DIR, "out", "performance")
+            p = save_refs_file(ref_rows, refs_dir, mod.NAME, tag=_run_suffix)
+            if p:
+                print(f"[REFS] create 返回 Ref 已落盘: {p}（{len(ref_rows)} 条）")
+            else:
+                print("[REFS] 未解析到 create 业务 Ref（mock 不答业务，需真实中台）")
 
     finally:
         if mock:

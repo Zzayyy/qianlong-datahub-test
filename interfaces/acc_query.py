@@ -17,6 +17,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (expand, build_account, REAL_ACCOUNT, REAL_SIGN,
                      STRESS_ACCOUNT_POOL, REAL_ACCOUNT_POOL,
+                     ACCOUNT_START, fmt_account,
                      gen_account_variety, gen_fuzz, gen_cross)
 
 NAME = "acc_query"
@@ -89,6 +90,30 @@ _ROWS_BULK += gen_cross(HEADERS, ROWS[0], accounts=REAL_ACCOUNT_POOL, injects=[
     ("TradePwd", "__LONG_PWD__"), ("AccountType", "__HUGE__"), ("AccAtt", 99), ("Model", "__MAXINT__"),
 ], type_tag="destroy", start=300)
 ROWS = ROWS + _ROWS_BULK
+
+# ==================== 批量账号查询生成（性能测试：N 行不循环）====================
+# 与 acc_sign 同一号段：每行查一个已签账号（先跑 acc_sign 批量签署）。
+
+
+def build_bulk_rows(count, start=0):
+    """生成 count 行 normal（每行一个不同已签账号的查询），供 make_excel --bulk-normal 使用。"""
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    if start + count - 1 > 999999:
+        raise ValueError(f"账号序号 {start + count - 1} 超出 6 位上限 999999")
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        out.append((
+            f"AGQ{i + 1:04d}", "normal",
+            f"账号{facct} 查询签署状态",
+            0, 7, 6, facct, PWD,
+            "批量正常账号：查询已签账号信息",
+        ))
+    return out
 
 
 def build_payload(row: dict) -> dict:
