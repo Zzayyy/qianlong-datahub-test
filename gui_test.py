@@ -1098,8 +1098,13 @@ class MainWindow(QWidget):
             ok = sum(self._safe_float(s.get("成功数")) for _, s in rows)
             fail = sum(self._safe_float(s.get("失败数")) for _, s in rows)
             thr = sum(self._safe_float(s.get("吞吐(条/s,按发送耗时)")) for _, s in rows)
-            cpu_avg = [self._safe_float(s.get("CPU平均%")) for _, s in rows]
-            cpu_avg = [v for v in cpu_avg if v > 0]
+            # CPU 合计按"发送耗时"加权（各接口串行时长不同，等权平均无意义）
+            cpu_avg_w = []
+            for _, s in rows:
+                c = self._safe_float(s.get("CPU平均%"))
+                w = self._safe_float(s.get("发送耗时(s)"))
+                if c > 0 and w > 0:
+                    cpu_avg_w.append((c, w))
             cpu_peak = [self._safe_float(s.get("CPU峰值%")) for _, s in rows]
             cpu_peak = [v for v in cpu_peak if v > 0]
             redis_inc = sum(self._safe_float(s.get("Redis写入增量")) for _, s in rows)
@@ -1128,7 +1133,8 @@ class MainWindow(QWidget):
             agg[7] = round(miss, 1) if miss_vals else ""
             agg[8] = round(got / exp * 100, 2) if exp > 0 else ""
             agg[9] = round(thr, 2)
-            agg[10] = round(sum(cpu_avg) / len(cpu_avg), 1) if cpu_avg else ""
+            agg[10] = round(sum(c * w for c, w in cpu_avg_w) / sum(w for _, w in cpu_avg_w), 1) \
+                if cpu_avg_w else ""
             agg[11] = round(max(cpu_peak), 1) if cpu_peak else ""
             agg[12] = redis_inc
             self._set_summary_row(len(rows), agg, bold=True)

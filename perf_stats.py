@@ -90,6 +90,24 @@ class CpuSampler:
         # 合理上限：最多占满所有核（多核可 >100%）
         return min(max(pct, 0.0), 100.0 * self.ncpu)
 
+    def snapshot(self):
+        """返回 (墙钟秒, 进程 CPU ticks)。两次快照配合 usage_between 可算整段平均。"""
+        return time.time(), _read_proc_ticks(self.pid)
+
+    def usage_between(self, snap0, snap1):
+        """两个 snapshot 之间进程平均占用核数百分比；任一无效返回 None。
+
+        用于 mark_send_start/end 包围的"发送阶段"积分，不受采样频率/空闲秒影响。
+        """
+        if not snap0 or not snap1:
+            return None
+        t0, tk0 = snap0
+        t1, tk1 = snap1
+        dt = t1 - t0
+        if dt <= 0 or tk0 is None or tk1 is None or tk1 < tk0:
+            return None
+        return min((tk1 - tk0) / self._clock / dt * 100.0, 100.0 * self.ncpu)
+
 
 # ==================== 性能统计 ====================
 class PerfStats:
@@ -110,6 +128,8 @@ class PerfStats:
         self.stop_ts = None
         self.send_start_ts = None      # 发送阶段开始（真实吞吐用）
         self.send_end_ts = None        # 发送阶段结束
+        self._cpu_snap0 = None         # mark_send_start 时 CPU 快照 (墙钟, ticks)
+        self._cpu_snap1 = None         # mark_send_end  时 CPU 快照
         self.per_sec = OrderedDict()   # epoch秒 -> dict
         self.send_times = []           # 每次 SendMQ 耗时（µs）
         self.xadd_times = []           # 每次直写 XADD 耗时（µs，destroy 测试）
@@ -124,12 +144,14 @@ class PerfStats:
         self._sampler = None
         self._stop = threading.Event()
 
-    # ---------- 发送阶段标记（用于真实吞吐，不含 wait 时间）----------
+    # ---------- 发送阶段标记（用于真实吞吐/CPU，不含 wait 时间）----------
     def mark_send_start(self):
         self.send_start_ts = time.time()
+        self._cpu_snap0 = self.cpu.snapshot()
 
     def mark_send_end(self):
         self.send_end_ts = time.time()
+        self._cpu_snap1 = self.cpu.snapshot()
 
     # ---------- 记录 ----------
     def record_send(self, ok, payload_bytes, elapsed_us, kind="sendmq"):
@@ -140,7 +162,7 @@ class PerfStats:
             sec = int(time.time())
             rec = self.per_sec.setdefault(sec, {
                 "sec": sec, "req": 0, "bytes": 0, "fail": 0,
-                "cpu": 0.0, "xlen_delta": 0, "send_us_sum": 0.0, "send_us_n": 0,
+                "cpu": 0.0, "cpu_n": 0, "xlen_delta": 0, "send_us_sum": 0.0, "send_us_n": 0,
                 "xadd_us_sum": 0.0, "xadd_us_n": 0,
             })
             rec["req"] += 1
@@ -234,10 +256,11 @@ class PerfStats:
             sec = int(time.time())
             rec = self.per_sec.setdefault(sec, {
                 "sec": sec, "req": 0, "bytes": 0, "fail": 0,
-                "cpu": 0.0, "xlen_delta": 0, "send_us_sum": 0.0, "send_us_n": 0,
+                "cpu": 0.0, "cpu_n": 0, "xlen_delta": 0, "send_us_sum": 0.0, "send_us_n": 0,
                 "xadd_us_sum": 0.0, "xadd_us_n": 0,
             })
             rec["cpu"] = max(rec["cpu"], cpu)   # 该秒取 CPU 峰值
+            rec["cpu_n"] += 1                   # 该秒 CPU 采样点数（峰值可信度参考）
             if xlen is not None:
                 if self._last_xlen is not None:
                     d = max(xlen - self._last_xlen, 0)
@@ -246,7 +269,8 @@ class PerfStats:
                 self._last_xlen = xlen
 
     def _run(self, interval):
-        # 高频率采 CPU（0.25s），XLEN 按传入的 interval 采样（避免 Redis 查询过频）
+        # CPU 高频采样 0.05s（读 /proc 开销极小），峰值接近真实尖峰；
+        # XLEN 仍按传入的 interval 采样（避免 Redis 查询过频）
         last_xlen_t = 0.0
         while not self._stop.is_set():
             now = time.time()
@@ -254,7 +278,7 @@ class PerfStats:
             if update_xlen:
                 last_xlen_t = now
             self._sample_once(update_xlen=update_xlen)
-            self._stop.wait(0.25)
+            self._stop.wait(0.05)
 
     # ---------- 汇总 ----------
     def summary(self):
@@ -282,6 +306,12 @@ class PerfStats:
             # 只统计有实际请求的秒：排除启动/空闲阶段的瞬时尖峰（如插件初始化占满多核）
             active = [rec for rec in self.per_sec.values() if rec.get("req", 0) > 0]
             cpu_vals = [rec.get("cpu", 0) for rec in active if rec.get("cpu", 0) > 0]
+            # 发送阶段 CPU 积分平均（主指标）：mark_send_start/end 之间 ticks 增量 / 阶段墙钟，
+            # 不受采样点分布与空等秒影响；未标记阶段时回退按秒峰值平均。
+            cpu_stage_raw = self.cpu.usage_between(self._cpu_snap0, self._cpu_snap1)
+            cpu_stage = cpu_stage_raw if cpu_stage_raw is not None else \
+                ((sum(cpu_vals) / len(cpu_vals)) if cpu_vals else 0.0)
+            cpu_samp_n = sum(rec.get("cpu_n", 0) for rec in active)   # 有请求秒的 CPU 采样点数
             # XLEN 采样增量（参考值）：对全部秒求和，避免最后一次补采样落在空闲秒被漏掉
             redis_inc = sum(rec.get("xlen_delta", 0) for rec in self.per_sec.values())
             # 有直写 XADD 精确计数则优先使用（destroy 场景与"总请求数"对齐），否则退回采样值
@@ -308,8 +338,12 @@ class PerfStats:
                 "XADD p90(µs)": pct(0.90, xtimes),
                 "XADD p99(µs)": pct(0.99, xtimes),
                 "XADD max(µs)": round(xtimes[-1], 1) if xtimes else "N/A",
-                "CPU平均%": round(sum(cpu_vals) / len(cpu_vals), 1) if cpu_vals else 0.0,
+                "CPU平均%": round(cpu_stage, 1),
                 "CPU峰值%": round(max(cpu_vals), 1) if cpu_vals else 0.0,
+                "CPU口径": ("发送阶段积分(核%)" if cpu_stage_raw is not None
+                            else "按秒采样(未标记发送阶段)"),
+                "CPU峰值口径": "0.05s采样瞬时峰值(发送段<0.1s时可能低估，参考采样点数)",
+                "CPU采样点数": cpu_samp_n,
                 "Redis写入增量": redis_written,
                 "Redis写入(采样参考)": redis_inc,
                 "每秒采样点数": len(self.per_sec),
