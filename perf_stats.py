@@ -292,6 +292,13 @@ class PerfStats:
             send_dur = 0.0
             if self.send_start_ts and self.send_end_ts:
                 send_dur = max(self.send_end_ts - self.send_start_ts, 1e-6)
+            # 阶段拆分：初始化(CreateMQ/握手) / 发送 / 等待回复(收尾)
+            init_dur = None
+            wait_dur = None
+            if self.start_ts and self.send_start_ts:
+                init_dur = max(self.send_start_ts - self.start_ts, 0.0)
+            if self.send_end_ts and self.stop_ts:
+                wait_dur = max(self.stop_ts - self.send_end_ts, 0.0)
             # SendMQ 耗时分位数（仅统计走插件的发送；destroy 直写另列 XADD 指标）
             times = sorted(self.send_times)
             xtimes = sorted(self.xadd_times)
@@ -322,7 +329,9 @@ class PerfStats:
                 "失败数": self.send_fail,
                 "成功率%": (self.send_ok / total * 100) if total else 0.0,
                 "总耗时(含等待,s)": round(dur, 3),
+                "初始化耗时(s)": round(init_dur, 3) if init_dur is not None else "N/A",
                 "发送耗时(s)": round(send_dur, 3) if send_dur else "N/A",
+                "等待回复耗时(s)": round(wait_dur, 3) if wait_dur is not None else "N/A",
                 "吞吐(条/s,按发送耗时)": round(total / send_dur, 2) if send_dur else 0.0,
                 "请求总字节(B)": self.bytes_ok + self.bytes_fail,
                 "请求字节(KB/s,按发送耗时)": round((self.bytes_ok + self.bytes_fail) / send_dur / 1024, 2) if send_dur else 0.0,

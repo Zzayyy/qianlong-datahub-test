@@ -325,7 +325,7 @@ class DataHubClient:
             if ret >= 0:
                 print(f"[OK] 插件已 inited（{time.time() - start:.1f}s），可发送")
                 return True
-            time.sleep(0.5)
+            # time.sleep(0.5)
         print(f"[FAIL] {timeout}s 内插件未 inited")
         return False
 
@@ -771,7 +771,7 @@ def main():
         print(f"[INFO] (先于 CreateMQ) 启动模拟数据中台应答器，订阅 {beat_channels}...")
         mock = MockDataHub(REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, channels=beat_channels)
         mock.start()
-        time.sleep(0.3)   # 给订阅握手指令留一点时间
+        # time.sleep(0.3)   # 给订阅握手指令留一点时间
 
     # ---------- 2) CreateMQ：插件上线后即刻被 mock 应答 ----------
     client = DataHubClient(so, unique=mod.NAME, reply_flag=args.reply)
