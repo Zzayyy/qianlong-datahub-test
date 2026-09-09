@@ -1097,7 +1097,8 @@ class MainWindow(QWidget):
             total = sum(self._safe_float(s.get("总请求数")) for _, s in rows)
             ok = sum(self._safe_float(s.get("成功数")) for _, s in rows)
             fail = sum(self._safe_float(s.get("失败数")) for _, s in rows)
-            thr = sum(self._safe_float(s.get("吞吐(条/s,按发送耗时)")) for _, s in rows)
+            # 总发送耗时（各接口串行相加）；合计吞吐 = 总条数 ÷ 总发送耗时（不能把各接口速率相加）
+            send_dur_sum = sum(self._safe_float(s.get("发送耗时(s)")) for _, s in rows)
             # CPU 合计按"发送耗时"加权（各接口串行时长不同，等权平均无意义）
             cpu_avg_w = []
             for _, s in rows:
@@ -1132,7 +1133,7 @@ class MainWindow(QWidget):
             agg[6] = round(got, 1) if got_vals else ""
             agg[7] = round(miss, 1) if miss_vals else ""
             agg[8] = round(got / exp * 100, 2) if exp > 0 else ""
-            agg[9] = round(thr, 2)
+            agg[9] = round(total / send_dur_sum, 2) if send_dur_sum > 0 else ""
             agg[10] = round(sum(c * w for c, w in cpu_avg_w) / sum(w for _, w in cpu_avg_w), 1) \
                 if cpu_avg_w else ""
             agg[11] = round(max(cpu_peak), 1) if cpu_peak else ""
