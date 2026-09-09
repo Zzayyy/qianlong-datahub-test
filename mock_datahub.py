@@ -156,10 +156,19 @@ class MockDataHub:
         self.answered = 0          # 已应答次数
         self.last_unique = None    # 最近应答的 unique_string
         self._lock = threading.Lock()
+        self._ready = threading.Event()   # 订阅就绪信号（CreateMQ 前等待，避免漏首轮上线）
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def wait_ready(self, timeout=10.0):
+        """等待订阅就绪。必须在 CreateMQ 之前调用：若应答器还没订阅完频道，
+        插件首轮上线(id=-1)会被漏掉，只能等下一轮心跳（可能 ~10s）才 inited。"""
+        ok = self._ready.wait(timeout)
+        if not ok:
+            print("[MOCK] 等待订阅就绪超时", flush=True)
+        return ok
 
     def stop(self):
         self._stop.set()
@@ -207,6 +216,7 @@ class MockDataHub:
                 confirmed = conn.subscribe_many(self.channels)
                 print(f"[MOCK] 已订阅 {len(confirmed)} 个频道: {self.channels} "
                       f"(host={self.host})", flush=True)
+                self._ready.set()
                 while not self._stop.is_set():
                     msg = conn.listen(timeout=1.0)
                     if msg is None:

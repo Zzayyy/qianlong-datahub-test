@@ -36,20 +36,16 @@ def _read_total_cpu_ticks():
     return None
 
 
-def _read_proc_ticks(pid):
-    """/proc/<pid>/stat 的进程 CPU ticks（utime+stime+cutime+cstime）"""
+def _proc_cpu_secs():
+    """本进程全部线程的用户+系统 CPU 时间（秒）。
+
+    用 resource.getrusage(RUSAGE_SELF)：Linux 上统计进程内所有线程（含 .so 加载后创建的
+    pthread），与 ps 的整进程口径一致。手拆 /proc/<pid>/task/*/stat 易漏线程且解析开销大。
+    """
     try:
-        with open(f"/proc/{pid}/stat") as f:
-            data = f.read()
-        # 进程名可能含空格，从最后一个 ')' 后面取字段
-        rp = data.rfind(")")
-        parts = data[rp + 2:].split()
-        # 字段 14=utime, 15=stime, 16=cutime, 17=cstime（1 起算，前移 2 后索引 11,12,13,14）
-        utime = int(parts[11])
-        stime = int(parts[12])
-        cutime = int(parts[13])
-        cstime = int(parts[14])
-        return utime + stime + cutime + cstime
+        import resource
+        r = resource.getrusage(resource.RUSAGE_SELF)
+        return r.ru_utime + r.ru_stime
     except Exception:
         return None
 
@@ -57,42 +53,37 @@ def _read_proc_ticks(pid):
 class CpuSampler:
     """客户端进程 CPU 利用率采样。
 
-    计算方式：进程 CPU ticks 差值 / 墙钟时间，得出"进程占用了多少个核"（可 >100%）。
-    比 psutil.cpu_percent(None) 更稳（psutil 在多线程/短窗口下会返回失真值，如 6091%）。
+    计算方式：进程 CPU 时间差 / 墙钟时间，得出"进程占用了多少个核"（可 >100%）。
+    基于 resource.getrusage（进程全部线程，含插件线程），比 psutil 短窗口更稳。
     """
 
     def __init__(self):
         self.pid = os.getpid()
-        self._last_proc_ticks = _read_proc_ticks(self.pid)
+        self._last_cpu_secs = _proc_cpu_secs()
         self._last_wall = time.time()
-        self._clock = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-        if not self._clock:
-            self._clock = 100
         self.ncpu = os.cpu_count() or 1
 
     def sample(self):
         """返回进程 CPU 利用率（占用核数，%）。首次调用返回 0。"""
         now = time.time()
-        proc_now = _read_proc_ticks(self.pid)
-        if proc_now is None or self._last_proc_ticks is None:
-            self._last_proc_ticks = proc_now
+        cpu_now = _proc_cpu_secs()
+        if cpu_now is None or self._last_cpu_secs is None:
+            self._last_cpu_secs = cpu_now
             self._last_wall = now
             return 0.0
         dt = now - self._last_wall
         if dt <= 0:
             return 0.0
-        # 进程 CPU 时间（秒）= ticks / CLK_TCK
-        proc_sec = (proc_now - self._last_proc_ticks) / self._clock
-        # 占用核数 = proc_sec / dt，换算成百分比
-        pct = proc_sec / dt * 100.0
-        self._last_proc_ticks = proc_now
+        # CPU 时间已是秒，直接除墙钟得占用核数百分比
+        pct = (cpu_now - self._last_cpu_secs) / dt * 100.0
+        self._last_cpu_secs = cpu_now
         self._last_wall = now
         # 合理上限：最多占满所有核（多核可 >100%）
         return min(max(pct, 0.0), 100.0 * self.ncpu)
 
     def snapshot(self):
-        """返回 (墙钟秒, 进程 CPU ticks)。两次快照配合 usage_between 可算整段平均。"""
-        return time.time(), _read_proc_ticks(self.pid)
+        """返回 (墙钟秒, 进程CPU秒)。两次快照配合 usage_between 可算整段平均。"""
+        return time.time(), _proc_cpu_secs()
 
     def usage_between(self, snap0, snap1):
         """两个 snapshot 之间进程平均占用核数百分比；任一无效返回 None。
@@ -101,12 +92,12 @@ class CpuSampler:
         """
         if not snap0 or not snap1:
             return None
-        t0, tk0 = snap0
-        t1, tk1 = snap1
+        t0, c0 = snap0
+        t1, c1 = snap1
         dt = t1 - t0
-        if dt <= 0 or tk0 is None or tk1 is None or tk1 < tk0:
+        if dt <= 0 or c0 is None or c1 is None or c1 < c0:
             return None
-        return min((tk1 - tk0) / self._clock / dt * 100.0, 100.0 * self.ncpu)
+        return min((c1 - c0) / dt * 100.0, 100.0 * self.ncpu)
 
 
 # ==================== 性能统计 ====================

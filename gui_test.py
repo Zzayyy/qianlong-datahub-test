@@ -344,10 +344,11 @@ class SummaryLoader(QThread):
     """后台扫描下载目录 *_stats.json 并解析（磁盘 IO 不阻塞 GUI）"""
     done = Signal(object, int, str)   # (rows, file_count, error)
 
-    def __init__(self, download_dir, batch_start, parent=None):
+    def __init__(self, download_dir, batch_start, parent=None, expand=False):
         super().__init__(parent)
         self.download_dir = download_dir
         self.batch_start = batch_start
+        self.expand = expand   # True: 多进程运行展开为"每进程一行"
 
     def run(self):
         try:
@@ -369,12 +370,27 @@ class SummaryLoader(QThread):
                 # 只统计本次批量开始后下载的文件
                 files = [x for x in files if x[0] >= self.batch_start - 5]
             file_count = len(files)
+            # 同一接口多份文件时保留最新一份（按 mtime 排序后者覆盖）
             by_name = {}
             for _mtime, full, data in sorted(files, key=lambda x: x[0]):
                 if isinstance(data, dict):
                     by_name[data.get("interface") or os.path.basename(full)] = data
-            rows = [(n, d["summary"]) for n, d in by_name.items()
-                    if isinstance(d, dict) and isinstance(d.get("summary"), dict)]
+            rows = []
+            for n, d in by_name.items():
+                if not (isinstance(d, dict) and isinstance(d.get("summary"), dict)):
+                    continue
+                ps = d.get("proc_summaries") or []
+                procs = int(d.get("procs") or 1)
+                if self.expand and ps:
+                    # 展开模式：显示每进程一行（替代父级一行，避免合计重复计算）
+                    for item in ps:
+                        if isinstance(item.get("summary"), dict):
+                            rows.append((item.get("name") or f"{n}(proc?)",
+                                         item["summary"]))
+                else:
+                    # 全局合并行：多进程时标注进程数，避免 CPU>100% 被误读为单进程异常
+                    label = f"{n}({procs}进程合并)" if procs > 1 else n
+                    rows.append((label, d["summary"]))
             self.done.emit(rows, file_count, "")
         except Exception as e:
             self.done.emit([], 0, str(e))
@@ -390,6 +406,7 @@ DEFAULT_CONFIG = {
     "password": "qianlong@135246",
     "remote_dir": "/home/yangsh/so_test",
     "workers": "4",
+    "procs": "1",    # 多进程并行数（1=单进程；>1 需远程 Linux + .so）
     "max": "0",
     "wait": "5.0",
     "mock": "1",
@@ -397,6 +414,7 @@ DEFAULT_CONFIG = {
     "destroy_mode": "mixed",
     "download": "1",
     "auto_export": "0",  # 批量完成后自动保存汇总 Excel（0=只显示，需时手动导出）
+    "summary_expand": "0",  # 多进程运行汇总按进程展开显示（1=每进程一行，0=仅全局一行）
     "download_dir": "out/performance",
     "remote": "1",       # 启用远程执行
     "quiet": "1",        # 安静模式
@@ -689,6 +707,9 @@ class MainWindow(QWidget):
         self.spin_max = QSpinBox()
         self.spin_max.setRange(0, 10000000)
         self.spin_max.setValue(int(self.cfg.get("max", "0")))
+        self.spin_max.setToolTip(
+            "总条数上限（0=全部）。注意：并行进程数>1 时，此值为全部进程合计条数，"
+            "会按进程均分；不会每个进程都发满 N 次")
         g2.addWidget(self.spin_max, 0, 3)
 
         # 行1：等待回复 / 安静模式
@@ -767,6 +788,16 @@ class MainWindow(QWidget):
             "· 用于核对动态单号(__REFn__)展开、字段内容是否正确\n"
             "· 本地 Windows 没有 .so，不勾选也只会预览")
         g2.addWidget(self.chk_preview, 6, 0, 1, 4)
+        # 行7：多进程并行（--procs，每进程独立插件连接；突破单连接吞吐）
+        g2.addWidget(QLabel("并行进程数:"), 7, 0)
+        self.spin_procs = QSpinBox()
+        self.spin_procs.setRange(1, 32)
+        self.spin_procs.setValue(int(self.cfg.get("procs", "1")))
+        self.spin_procs.setToolTip(
+            "把用例自动按行号均分到 N 个进程，各进程独立 CreateMQ/插件连接并行发送，"
+            "用于突破单插件连接吞吐瓶颈（如 10000 条/秒目标）；需远程 Linux + .so。\n"
+            "并行时\"最多条数\"按全部进程合计均分，不会发成 N×max")
+        g2.addWidget(self.spin_procs, 7, 1, 1, 3)
         left_lay.addWidget(grp2)
 
         # ---- 远程 Linux（发送测试在其上执行）----
@@ -894,6 +925,12 @@ class MainWindow(QWidget):
             "勾选：本次批量发送全部完成后，自动把汇总表导出为 out/performance/批量汇总_时间.xlsx；\n"
             "不勾选：只刷新汇总表格显示，需要留存时手动点\"导出 Excel\"")
         top5.addWidget(self.chk_auto_export)
+        self.chk_summary_expand = QCheckBox("多进程按进程展开")
+        self.chk_summary_expand.setChecked(self.cfg.get("summary_expand", "0") == "1")
+        self.chk_summary_expand.setToolTip(
+            "勾选：多进程(procs>1)运行的汇总显示为每进程一行(create(p1)~create(pN))，便于对比各连接；\n"
+            "不勾选：只显示一行全局合并汇总（默认）。合计行始终按并行口径计算")
+        top5.addWidget(self.chk_summary_expand)
         top5.addStretch(1)
         self.btn_summary_refresh = QPushButton("刷新汇总")
         self.btn_summary_refresh.clicked.connect(self._refresh_summary)
@@ -1053,7 +1090,8 @@ class MainWindow(QWidget):
         if loader and loader.isRunning():
             self.append_log("[汇总] 正在刷新中，请稍候...")
             return
-        loader = SummaryLoader(self._download_dir_abs(), self._batch_start, self)
+        loader = SummaryLoader(self._download_dir_abs(), self._batch_start, self,
+                               expand=self.chk_summary_expand.isChecked())
         self._summary_loader = loader
         self.btn_summary_refresh.setEnabled(False)
         self.lbl_summary_info.setText("正在扫描统计文件...")
@@ -1309,6 +1347,7 @@ class MainWindow(QWidget):
         """构造 send_test.py 的命令行"""
         parts = ["python3", "send_test.py", "--interface", name,
                  "--workers", str(self.spin_workers.value()),
+                 "--procs", str(self.spin_procs.value()),
                  "--max", str(self.spin_max.value()),
                  "--wait", str(self.spin_wait.value())]
         types = self.selected_types()
@@ -1349,6 +1388,7 @@ class MainWindow(QWidget):
             "r_pwd": self.edit_r_pwd.text(),
             "r_db": str(self.spin_r_db.value()),
             "workers": str(self.spin_workers.value()),
+            "procs": str(self.spin_procs.value()),
             "max": str(self.spin_max.value()),
             "wait": str(self.spin_wait.value()),
             "mock": "1" if self.chk_mock.isChecked() else "0",
@@ -1363,6 +1403,7 @@ class MainWindow(QWidget):
             "remote": "1" if self.chk_remote.isChecked() else "0",
             "download": "1" if self.chk_download.isChecked() else "0",
             "auto_export": "1" if self.chk_auto_export.isChecked() else "0",
+            "summary_expand": "1" if self.chk_summary_expand.isChecked() else "0",
             "box_redis": "1" if self.box_redis.isExpanded() else "0",
             "box_linux": "1" if self.box_linux.isExpanded() else "0",
             "box_out": "1" if self.box_out.isExpanded() else "0",
@@ -1476,6 +1517,7 @@ class MainWindow(QWidget):
             "接口数": len(names),
             "接口": "、".join(names),
             "并发线程数(workers)": str(self.spin_workers.value()),
+            "并行进程数(procs)": str(self.spin_procs.value()),
             "最多条数(max)": str(self.spin_max.value()),
             "等待回复秒数(wait)": str(self.spin_wait.value()),
             "模拟应答器(mock)": "开" if self.chk_mock.isChecked() else "关",

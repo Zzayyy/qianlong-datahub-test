@@ -195,7 +195,8 @@ def load_interface(name):
 
 
 def load_cases(excel, max_cases):
-    wb = load_workbook(excel, data_only=True)
+    # read_only 流式：万行大表（如 create 10k×92 列）非 read_only 会整表物化，加载耗时数秒
+    wb = load_workbook(excel, read_only=True, data_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
@@ -581,6 +582,177 @@ def destroy_write_all(items, stats, batch_size=500, concurrency=4):
     return ok, time.time() - t0, "串行逐条(未安装redis库)"
 
 
+# ==================== 多进程并行发送（--procs N，Linux）====================
+# 原理：把 Excel 数据行按行号均分成 N 段，每段起一个子进程 send_test（--procs 1），
+# 子进程各自 CreateMQ/插件连接/独立 mock，突破单连接吞吐瓶颈；
+# 收齐后按各子进程 *_stats.json 合并成一份汇总（GUI 直接显示）。
+def _argv_without_key(argv, key):
+    """去掉 argv 里的 --key [value] 对（防子进程递归多进程）。"""
+    out = []
+    skip = False
+    for tok in argv:
+        if skip:
+            skip = False
+            continue
+        if tok == key:
+            skip = True
+            continue
+        out.append(tok)
+    return out
+
+
+def _split_data_rows(total, n):
+    """把 1..total 的数据行号尽量均分为 n 段，返回 [(a,b), ...]。"""
+    if total <= 0 or n <= 0:
+        raise ValueError("行数/进程数必须 > 0")
+    step, rem = divmod(total, n)
+    out, cur = [], 1
+    for i in range(n):
+        cnt = step + (1 if i < rem else 0)
+        out.append((cur, cur + cnt - 1))
+        cur += cnt
+    return out
+
+
+def _num(v):
+    if isinstance(v, (int, float)):
+        return float(v)
+    return None
+
+
+# 可近似加权合并的延迟列（严格分位不可合并，仅按请求数加权参考）
+_LAT_KEYS = ("SendMQ平均(µs)", "SendMQ p50(µs)", "SendMQ p90(µs)", "SendMQ p99(µs)",
+             "SendMQ max(µs)", "XADD均(µs)", "XADD p99(µs)")
+
+
+def _merge_summaries(merges):
+    """把 N 个进程的 summary dict 合并为一份（并发并行的聚合口径）。"""
+    m = {"总请求数": 0.0, "成功数": 0.0, "失败数": 0.0, "请求总字节(B)": 0.0,
+         "期望回复数": 0.0, "收到回复数": 0.0, "缺回复数": 0.0,
+         "Redis写入增量": 0.0, "Redis写入(采样参考)": 0.0, "CPU采样点数": 0.0}
+    reqs = []
+    for s in merges:
+        for k in m:
+            v = _num(s.get(k))
+            if v is not None:
+                m[k] += v
+        reqs.append(_num(s.get("总请求数")) or 0.0)
+    total = m["总请求数"]
+    ok = m["成功数"]
+    exp = m["期望回复数"]
+    got = m["收到回复数"]
+    m["成功率%"] = round(ok / total * 100, 2) if total else 0.0
+    m["回复率%"] = round(got / exp * 100, 2) if exp else "N/A"
+    m["平均单请求字节(B)"] = round(m["请求总字节(B)"] / total, 1) if total else 0
+
+    def _max_of(key):
+        vals = [_num(s.get(key)) for s in merges]
+        vals = [v for v in vals if v is not None]
+        return max(vals) if vals else None
+
+    init_d = _max_of("初始化耗时(s)")
+    wait_d = _max_of("等待回复耗时(s)")
+    wall_d = _max_of("总耗时(含等待,s)")
+    send_d = _max_of("发送耗时(s)")
+    m["总耗时(含等待,s)"] = round(wall_d, 3) if wall_d else "N/A"
+    m["初始化耗时(s)"] = round(init_d, 3) if init_d else "N/A"
+    m["等待回复耗时(s)"] = round(wait_d, 3) if wait_d else "N/A"
+    m["发送耗时(s)"] = round(send_d, 3) if send_d else "N/A"
+    # 并行：整批墙钟 ≈ 各进程发送耗时的最大值；吞吐 = 总条数 / 该窗口
+    m["吞吐(条/s,按发送耗时)"] = round(total / send_d, 2) if send_d else 0.0
+    m["请求字节(KB/s,按发送耗时)"] = round(m["请求总字节(B)"] / send_d / 1024, 2) if send_d else 0.0
+    # CPU：各进程并行，占用核数可叠加；峰值取最大
+    cpus = [_num(s.get("CPU平均%")) for s in merges]
+    cpus = [c for c in cpus if c is not None]
+    peaks = [_num(s.get("CPU峰值%")) for s in merges]
+    peaks = [c for c in peaks if c is not None]
+    m["CPU平均%"] = round(sum(cpus), 1) if cpus else 0.0
+    m["CPU峰值%"] = round(max(peaks), 1) if peaks else 0.0
+    m["CPU口径"] = "各进程发送阶段积分之和(多进程并行)"
+    for k in _LAT_KEYS:
+        num = 0.0
+        den = 0.0
+        for s, w in zip(merges, reqs):
+            v = _num(s.get(k))
+            if v is not None and w > 0:
+                num += v * w
+                den += w
+        m[k] = round(num / den, 1) if den else "N/A"
+    m["延迟口径"] = "各进程按请求数加权近似(分位仅供参考)"
+    return m
+
+
+def run_multi_procs(args, mod, excel, total_rows):
+    """--procs>1：分片起 N 个子进程发送，收齐后合并汇总写总 JSON。"""
+    import subprocess as _sp
+    import glob as _gl
+    import json as _json
+    if args.cases:
+        sys.exit("[FAIL] --cases 与 --procs>1 不能同时使用：分片由进程数自动完成")
+    if total_rows < args.procs:
+        sys.exit(f"[FAIL] 数据行数 {total_rows} 小于进程数 {args.procs}，请调小 --procs")
+    ranges = _split_data_rows(total_rows, args.procs)
+    script = os.path.abspath(__file__)
+    stats_root = args.stats_out or os.path.join(BASE_DIR, "out", "performance")
+    os.makedirs(stats_root, exist_ok=True)
+    proc_dirs = [os.path.join(stats_root, f"proc{i + 1}") for i in range(args.procs)]
+    base = _argv_without_key(sys.argv[1:], "--procs")
+    base = _argv_without_key(base, "--max")   # --max 是"全部进程合计上限"，由下面按进程均分
+    # --max M>0 表示总目标条数：均分到各进程（余数给前几个），避免每进程各自循环满 M -> N×M
+    per = args.max // args.procs if args.max else 0
+    rem = args.max % args.procs if args.max else 0
+    # 清掉 proc 目录历史 JSON，避免合并时把历次运行的文件也算进去
+    for d in proc_dirs:
+        if os.path.isdir(d):
+            for f in _gl.glob(os.path.join(d, "*_stats.json")):
+                os.remove(f)
+    children = []
+    for i, (a, b) in enumerate(ranges):
+        os.makedirs(proc_dirs[i], exist_ok=True)
+        per_max = (per + (1 if i < rem else 0)) if args.max else 0
+        cmd = [sys.executable, script] + base + [
+            "--procs", "1", "--cases", f"{a}-{b}", "--max", str(per_max),
+            "--stats-out", proc_dirs[i]]
+        print(f"[PROC{i + 1}] 数据行 {a}-{b} -> {os.path.relpath(proc_dirs[i], stats_root)}"
+              f"（该进程最多 {per_max or '本段全部'} 条）")
+        env = dict(os.environ)
+        env["SEND_RUN_SUFFIX"] = f"_p{i + 1}"
+        children.append(_sp.Popen(cmd, env=env))
+    codes = [p.wait() for p in children]
+    print(f"[PROCS] 子进程退出码: {codes}")
+
+    merges = []
+    for d in proc_dirs:
+        for f in sorted(_gl.glob(os.path.join(d, "*_stats.json"))):
+            try:
+                with open(f, encoding="utf-8") as fh:
+                    merges.append(_json.load(fh).get("summary") or {})
+            except Exception as e:
+                print(f"[WARN] 读取 {f} 失败: {e}")
+    if not merges:
+        sys.stdout.flush()
+        os._exit(1)
+    merged = _merge_summaries(merges)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(stats_root, f"{mod.NAME}_{ts}_stats.json")
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump({
+            "interface": mod.NAME, "ts": ts, "summary": merged,
+            "procs": args.procs,
+            "proc_dirs": [os.path.relpath(d, stats_root) for d in proc_dirs],
+            # 每进程独立摘要：GUI 勾"按进程展开"时直接用它显示成 N 行
+            "proc_summaries": [
+                {"proc": i + 1, "name": f"{mod.NAME}(p{i + 1})", "summary": s}
+                for i, s in enumerate(merges)],
+        }, f, ensure_ascii=False, indent=2)
+    print(f"[STATS] 多进程合并汇总已保存: {path}")
+    print("[STATS] 合并汇总:")
+    for k, v in merged.items():
+        print(f"  {k}: {v}")
+    sys.stdout.flush()
+    os._exit(0 if all(c == 0 for c in codes) else 1)
+
+
 def show_reply_streams():
     """在日志中提示中台回复落点：从 DataHub_req_stream 最近几条请求里
     提取 reply_req_stream / reply_reply_stream 字段的实际键名（安静模式也打印）。"""
@@ -621,6 +793,9 @@ def main():
     ap.add_argument("--excel", default="", help="Excel 路径（默认 data/{接口}.xlsx）")
     ap.add_argument("--so", default="", help=".so 路径，缺省自动查找")
     ap.add_argument("--workers", type=int, default=4, help="并发线程数")
+    ap.add_argument("--procs", type=int, default=1,
+                    help="多进程并行数：把用例按行号均分到 N 个进程，各进程独立 CreateMQ/插件连接发送"
+                         "（突破单插件连接吞吐瓶颈；仅 Linux/.so 环境，需配合远程执行）")
     ap.add_argument("--max", type=int, default=0, help="最多处理多少条(0=全部)")
     ap.add_argument("--type", default="",
                     help="只发指定用例类型，逗号分隔，如 normal,error,destroy,probe"
@@ -665,10 +840,25 @@ def main():
 
     mod = load_interface(args.interface)
 
+    # ---- 多进程并行：分片起 N 个子进程发送，收齐后合并汇总（此后不再走单进程逻辑）----
+    if args.procs and args.procs > 1:
+        if find_so(args.so) is None:
+            sys.exit("[FAIL] 多进程模式需要 .so（Linux 远程执行）；本地无 .so 请用 --procs 1 预览")
+        if args.no_send:
+            sys.exit("[FAIL] --no-send 与 --procs>1 不能组合：预览只支持单进程（--procs 1）")
+        excel0 = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
+        rows_all = load_cases(excel0, 0)
+        if not rows_all:
+            sys.exit(f"[FAIL] {excel0} 中无有效用例（表头之后没有数据行）")
+        run_multi_procs(args, mod, excel0, len(rows_all))
+        return
+
     # ---- 运行日志：tee stdout 到文件（排查问题用），统计明细最后追加 ----
     run_dir = os.path.join(BASE_DIR, "out", "logs")
     os.makedirs(run_dir, exist_ok=True)
-    run_log = os.path.join(run_dir, f"{mod.NAME}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    # 多进程子进程各自带后缀，避免同一秒的并行进程互相覆盖运行日志
+    _run_suffix = os.environ.get("SEND_RUN_SUFFIX", "")
+    run_log = os.path.join(run_dir, f"{mod.NAME}{_run_suffix}_{time.strftime('%Y%m%d_%H%M%S')}.log")
     _orig_stdout = sys.stdout
     sys.stdout = _Tee(_orig_stdout, open(run_log, "w", encoding="utf-8"))
     _banner(f"[START] {mod.NAME} · send_test · {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -771,7 +961,10 @@ def main():
         print(f"[INFO] (先于 CreateMQ) 启动模拟数据中台应答器，订阅 {beat_channels}...")
         mock = MockDataHub(REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, channels=beat_channels)
         mock.start()
-        # time.sleep(0.3)   # 给订阅握手指令留一点时间
+        # 等订阅就绪再 CreateMQ：固定 sleep 不可靠（被注释后 mock 未订阅完就 CreateMQ，
+        # 首轮上线被漏掉，只能等插件下一轮心跳 ~10s，表现为长时间卡顿）
+        if not mock.wait_ready(timeout=args.init_wait):
+            raise SystemExit("mock 订阅未就绪，无法继续")
 
     # ---------- 2) CreateMQ：插件上线后即刻被 mock 应答 ----------
     client = DataHubClient(so, unique=mod.NAME, reply_flag=args.reply)
