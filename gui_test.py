@@ -424,6 +424,12 @@ DEFAULT_CONFIG = {
     "bulk_accounts": "0",  # acc_sign 批量账号行数（N 行不同账号的正常数据；0=不启用）
     "bulk_start": "0",     # 批量账号起始序号（0=接口默认 011301）
     "preview": "0",      # 预览模式（--no-send，只生成报文不发送）
+    "soak": "0",         # 稳定性测试(Soak) 开关
+    "soak_hours": "8",   # Soak 总时长（小时）
+    "soak_batch": "1000",  # Soak 每轮条数
+    "soak_gap": "0",     # Soak 轮间间隔（秒）
+    "soak_clean": "monitor",  # Soak 流处理：monitor=只监控 / per-round=每轮清理回复流
+    "soak_rotate": "1",  # Soak 轮换用例（避免重复发同一批数据）
     "box_redis": "1",    # 右侧三个标题条的展开状态
     "box_linux": "1",
     "box_out": "1",
@@ -545,6 +551,7 @@ class MainWindow(QWidget):
         self.setWindowTitle("数据中台压力测试工具 (DataHub 压测客户端)")
         self.resize(1380, 900)
         self.worker = None
+        self._soak_running = False   # Soak/发送任务是否在跑（决定「运行稳定性测试」是否可点）
         self.cfg = load_config()
         self._batch_names = []
         self._batch_idx = 0
@@ -717,13 +724,15 @@ class MainWindow(QWidget):
         self.spin_workers.setValue(int(self.cfg.get("workers", "4")))
         g2.addWidget(self.spin_workers, 0, 1)
 
-        g2.addWidget(QLabel("最多条数(0=全部):"), 0, 2)
+        self.lbl_max = QLabel("最多条数(0=全部):")
+        g2.addWidget(self.lbl_max, 0, 2)
         self.spin_max = QSpinBox()
         self.spin_max.setRange(0, 10000000)
         self.spin_max.setValue(int(self.cfg.get("max", "0")))
         self.spin_max.setToolTip(
             "总条数上限（0=全部）。注意：并行进程数>1 时，此值为全部进程合计条数，"
-            "会按进程均分；不会每个进程都发满 N 次")
+            "会按进程均分；不会每个进程都发满 N 次\n"
+            "勾选「稳定性测试(Soak)」时此项不生效：每轮条数由「Soak每轮条数」决定")
         g2.addWidget(self.spin_max, 0, 3)
 
         # 行1：等待回复 / 安静模式
@@ -812,6 +821,80 @@ class MainWindow(QWidget):
             "用于突破单插件连接吞吐瓶颈（如 10000 条/秒目标）；需远程 Linux + .so。\n"
             "并行时\"最多条数\"按全部进程合计均分，不会发成 N×max")
         g2.addWidget(self.spin_procs, 7, 1, 1, 3)
+
+        # 行8：稳定性测试(Soak) 开关 —— 长时间连续跑 + 趋势聚合（由“运行稳定性测试”按钮触发）
+        self.chk_soak = QCheckBox("稳定性测试(Soak，长时间连续跑/趋势汇总)")
+        self.chk_soak.setChecked(self.cfg.get("soak", "0") == "1")
+        self.chk_soak.setToolTip(
+            "勾选后展开下方 Soak 参数（结束条件/每轮条数/流处理），再点「运行稳定性测试」：\n"
+            "· 复用 send_test.py 按轮持续发送\n"
+            "· 结束条件可选：按时长（默认 8 小时）或按轮数（短测用，跑够 N 轮自动收尾）\n"
+            "· 只输出 trend.csv / summary.json / soak.log（避免海量日志/表格）\n"
+            "· 需远程 Linux + .so；本地 Windows 无法真实发送")
+        g2.addWidget(self.chk_soak, 8, 0, 1, 4)
+
+        # 行9-11：Soak 参数区 —— 独立容器，随「稳定性测试」勾选显示/隐藏（方案B）
+        self.soak_params = QWidget()
+        gs = QGridLayout(self.soak_params)
+        gs.setContentsMargins(0, 0, 0, 0)
+        gs.setColumnStretch(1, 1)
+        gs.setColumnStretch(3, 1)
+
+        # 行9：结束条件（按时长 / 按轮数，二选一）
+        gs.addWidget(QLabel("Soak结束条件:"), 9, 0)
+        self.combo_soak_mode = QComboBox()
+        self.combo_soak_mode.addItem("按时长", "hours")
+        self.combo_soak_mode.addItem("按轮数", "rounds")
+        _sm = self.combo_soak_mode.findData(self.cfg.get("soak_mode", "hours"))
+        self.combo_soak_mode.setCurrentIndex(_sm if _sm >= 0 else 0)
+        self.combo_soak_mode.setToolTip(
+            "按轮数：跑够 N 轮即正常收尾（便于短测，最快几十秒就能验证整套流程）\n"
+            "按时长：连续跑到设定小时数")
+        gs.addWidget(self.combo_soak_mode, 9, 1)
+        gs.addWidget(QLabel("Soak每轮条数:"), 9, 2)
+        self.spin_soak_batch = QSpinBox()
+        self.spin_soak_batch.setRange(1, 1000000)
+        self.spin_soak_batch.setValue(int(self.cfg.get("soak_batch", "1000")))
+        gs.addWidget(self.spin_soak_batch, 9, 3)
+
+        # 行10：时长 / 轮数 两个输入框并排，按模式启用其中一个
+        gs.addWidget(QLabel("Soak时长(小时):"), 10, 0)
+        self.spin_soak_hours = QDoubleSpinBox()
+        self.spin_soak_hours.setRange(0.01, 240)
+        self.spin_soak_hours.setValue(float(self.cfg.get("soak_hours", "8")))
+        gs.addWidget(self.spin_soak_hours, 10, 1)
+        gs.addWidget(QLabel("Soak轮数:"), 10, 2)
+        self.spin_soak_rounds = QSpinBox()
+        self.spin_soak_rounds.setRange(1, 100000)
+        self.spin_soak_rounds.setValue(int(self.cfg.get("soak_rounds", "5")))
+        self.spin_soak_rounds.setToolTip("跑够这么多轮就正常结束（--rounds，优先于时长）")
+        gs.addWidget(self.spin_soak_rounds, 10, 3)
+        self.combo_soak_mode.currentIndexChanged.connect(self._sync_soak_mode)
+
+        # 行11：流处理 / 轮换用例 / 轮间隔
+        gs.addWidget(QLabel("Soak流处理:"), 11, 0)
+        self.combo_soak_clean = QComboBox()
+        self.combo_soak_clean.addItem("monitor 只监控不清理", "monitor")
+        self.combo_soak_clean.addItem("per-round 每轮清理回复流", "per-round")
+        _sc = self.combo_soak_clean.findData(self.cfg.get("soak_clean", "monitor"))
+        self.combo_soak_clean.setCurrentIndex(_sc if _sc >= 0 else 0)
+        gs.addWidget(self.combo_soak_clean, 11, 1)
+        self.chk_soak_rotate = QCheckBox("轮换用例")
+        self.chk_soak_rotate.setChecked(self.cfg.get("soak_rotate", "1") == "1")
+        self.chk_soak_rotate.setToolTip("每轮按行号轮换用例（末尾回绕），避免重复发同一批数据")
+        gs.addWidget(self.chk_soak_rotate, 11, 2)
+        self.spin_soak_gap = QDoubleSpinBox()
+        self.spin_soak_gap.setRange(0, 3600)
+        self.spin_soak_gap.setValue(float(self.cfg.get("soak_gap", "0")))
+        self.spin_soak_gap.setToolTip("每轮之间的停顿秒数")
+        gs.addWidget(self.spin_soak_gap, 11, 3)
+
+        g2.addWidget(self.soak_params, 9, 0, 1, 4)
+        # 勾选切换时展开/收起参数区；并同步时长/轮数的启用状态
+        self.chk_soak.toggled.connect(self._sync_soak_visibility)
+        self._sync_soak_visibility()
+        self._sync_soak_mode()
+
         left_lay.addWidget(grp2)
 
         # ---- 远程 Linux（发送测试在其上执行）----
@@ -900,6 +983,15 @@ class MainWindow(QWidget):
         self.btn_clear = QPushButton("清空日志")
         self.btn_clear.clicked.connect(lambda: self.log.clear())
         btns.addWidget(self.btn_send)
+        self.btn_soak = QPushButton("运行稳定性测试")
+        self.btn_soak.clicked.connect(self.on_soak)
+        self.btn_soak.setToolTip(
+            "需先勾选上方「稳定性测试(Soak)」才能运行\n"
+            "（勾选后才会展开 Soak 参数区，避免用看不见的参数跑长任务）")
+        btns.addWidget(self.btn_soak)
+        # Soak 参数区在 btn_soak 之前创建，那次 _sync_soak_visibility() 因
+        # btn_soak 尚未存在而被跳过；这里补一次初始同步，否则启动时按钮会异常可点
+        self._sync_soak_button()
         btns.addWidget(self.btn_stop)
         btns.addWidget(self.btn_clear)
         self.btn_upload_all = QPushButton("批量上传所有接口数据")
@@ -1316,6 +1408,10 @@ class MainWindow(QWidget):
         self.btn_send.setEnabled(not running)
         self.btn_make.setEnabled(not running)
         self.btn_stop.setEnabled(running)
+        # soak 按钮可用性由 _sync_soak_button 统一裁决（需勾选 Soak 且空闲），
+        # 不能在这里无条件 setEnabled(not running)，否则会覆盖"未勾选则置灰"
+        if hasattr(self, "btn_soak"):
+            self._sync_soak_button(running)
         if hasattr(self, "btn_upload_all"):
             self.btn_upload_all.setEnabled(not running)
         if hasattr(self, "btn_read_redis"):
@@ -1393,6 +1489,80 @@ class MainWindow(QWidget):
             parts.append(dm)
         return " ".join(parts)
 
+    def _soak_by_rounds(self):
+        """当前是否"按轮数"模式"""
+        return (self.combo_soak_mode.currentData() or "hours") == "rounds"
+
+    def _sync_soak_visibility(self):
+        """勾选「稳定性测试」才显示 Soak 参数区（方案B：未勾选时界面清爽）
+
+        同时把「最多条数」置灰：Soak 模式每轮条数由 --batch 决定，
+        soak 端强制用 --max <batch> 覆盖，此处的值不会生效。
+        """
+        soak_on = self.chk_soak.isChecked()
+        self.soak_params.setVisible(soak_on)
+        if hasattr(self, "spin_max"):
+            self.spin_max.setEnabled(not soak_on)
+            if hasattr(self, "lbl_max"):    # 标签一并灰化，避免"灰框配黑字"的割裂感
+                self.lbl_max.setEnabled(not soak_on)
+            self.spin_max.setToolTip(
+                "总条数上限（0=全部）。注意：并行进程数>1 时，此值为全部进程合计条数，"
+                "会按进程均分；不会每个进程都发满 N 次"
+                + ("\n【当前已勾选「稳定性测试(Soak)」→ 此项不生效】\n"
+                   "每轮条数改由下方「Soak每轮条数」决定（soak 会用它覆盖 --max）"
+                   if soak_on else ""))
+        self._sync_soak_button()
+
+    def _sync_soak_button(self, running=None):
+        """「运行稳定性测试」按钮可用性 = 已勾选 Soak 且当前空闲（方案B）
+
+        运行状态用显式标志 _soak_running 追踪：worker 在 set_running(True) 时
+        可能还没创建（旧对象或 None），靠 worker.isRunning() 判断会失准。
+        """
+        if not hasattr(self, "btn_soak"):
+            return
+        if running is not None:
+            self._soak_running = bool(running)
+        self.btn_soak.setEnabled(
+            self.chk_soak.isChecked() and not getattr(self, "_soak_running", False))
+
+    def _sync_soak_mode(self):
+        """按模式启用/禁用时长与轮数输入框（另一模式的值不参与命令行）"""
+        by_rounds = self._soak_by_rounds()
+        self.spin_soak_hours.setEnabled(not by_rounds)
+        self.spin_soak_rounds.setEnabled(by_rounds)
+
+    def build_soak_cmd(self, name):
+        """构造 soak_test.py 命令行（send_test 的发送参数作为透传传给它）"""
+        parts = ["python3", "soak_test.py",
+                 "--interface", name]
+        # 结束条件二选一：--rounds 优先于 --hours（soak 端两者同时给也以 rounds 为准）
+        if self._soak_by_rounds():
+            parts += ["--rounds", str(self.spin_soak_rounds.value())]
+        else:
+            parts += ["--hours", str(self.spin_soak_hours.value())]
+        parts += ["--batch", str(self.spin_soak_batch.value()),
+                  "--gap", str(self.spin_soak_gap.value()),
+                  "--clean", self.combo_soak_clean.currentData() or "monitor"]
+        if self.chk_soak_rotate.isChecked():
+            parts.append("--rotate")
+        # 透传给 send_test.py 的发送参数（soak 会原样转发）
+        parts += ["--workers", str(self.spin_workers.value()),
+                  "--procs", str(self.spin_procs.value()),
+                  "--wait", str(self.spin_wait.value())]
+        types = self.selected_types()
+        if types and len(types) < 3:
+            parts += ["--type", ",".join(types)]
+        if self.chk_preview.isChecked():
+            parts.append("--no-send")
+        if self.chk_mock.isChecked():
+            parts.append("--mock")
+        else:
+            parts.append("--no-mock")
+        if self.chk_quiet.isChecked():
+            parts.append("--quiet")
+        return " ".join(parts)
+
     def _pick_ref_map_file(self):
         """浏览选择 create 返回 Ref 的回填 JSON。"""
         cur = self.edit_ref_map.text().strip() or os.path.join(BASE_DIR, "out", "performance")
@@ -1427,6 +1597,14 @@ class MainWindow(QWidget):
             "preview": "1" if self.chk_preview.isChecked() else "0",
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
             "destroy_mode": self.combo_destroy_mode.currentData() or "mixed",
+            "soak": "1" if self.chk_soak.isChecked() else "0",
+            "soak_hours": str(self.spin_soak_hours.value()),
+            "soak_rounds": str(self.spin_soak_rounds.value()),
+            "soak_mode": self.combo_soak_mode.currentData() or "hours",
+            "soak_batch": str(self.spin_soak_batch.value()),
+            "soak_gap": str(self.spin_soak_gap.value()),
+            "soak_clean": self.combo_soak_clean.currentData() or "monitor",
+            "soak_rotate": "1" if self.chk_soak_rotate.isChecked() else "0",
             "remote": "1" if self.chk_remote.isChecked() else "0",
             "download": "1" if self.chk_download.isChecked() else "0",
             "auto_export": "1" if self.chk_auto_export.isChecked() else "0",
@@ -1515,7 +1693,7 @@ class MainWindow(QWidget):
                 if f.endswith(".xlsx") and not f.startswith("~$"):
                     files.append((os.path.join(DATA_DIR, f), f"{rd}/data/{f}"))
         # 脚本文件
-        for f in ("send_test.py", "mock_datahub.py", "make_excel.py"):
+        for f in ("send_test.py", "mock_datahub.py", "perf_stats.py", "make_excel.py", "soak_test.py"):
             files.append((os.path.join(BASE_DIR, f), f"{rd}/{f}"))
 
         self._save_ui_config()
@@ -1535,6 +1713,7 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "提示", "请至少勾选一个接口")
             return
         self._save_ui_config()
+        self._use_soak = False
         self._batch_names = names
         self._batch_idx = 0
         self._batch_stopped = False
@@ -1564,11 +1743,65 @@ class MainWindow(QWidget):
             self.append_log(f"\n[BATCH] 共 {len(names)} 个接口待发送: {', '.join(names)}")
         self._run_next_batch_item()
 
+    def on_soak(self):
+        """稳定性测试：对勾选的每个接口依次执行 soak_test.py（长时间连续跑 + 趋势汇总）"""
+        # 方案B：未勾选 Soak 时该按钮已被置灰，正常点不到；此处仅作兜底
+        if not self.chk_soak.isChecked():
+            return
+        names = self.selected_interfaces()
+        if not names:
+            QMessageBox.warning(self, "提示", "请至少勾选一个接口")
+            return
+        if not self.chk_remote.isChecked():
+            QMessageBox.warning(
+                self, "提示",
+                "稳定性测试建议勾选「启用远程执行」"
+                "（本地 Windows 无 .so，无法真实发送）")
+        self._save_ui_config()
+        self._use_soak = True
+        self._batch_names = names
+        self._batch_idx = 0
+        self._batch_stopped = False
+        self._batch_start = time.time()
+        self._batch_params = {
+            "时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "模式": "稳定性测试(Soak)",
+            "接口": "、".join(names),
+            "Soak结束条件": "按轮数" if self._soak_by_rounds() else "按时长",
+            "Soak轮数": str(self.spin_soak_rounds.value()) if self._soak_by_rounds() else "-",
+            "Soak时长(小时)": "-" if self._soak_by_rounds() else str(self.spin_soak_hours.value()),
+            "Soak每轮条数": str(self.spin_soak_batch.value()),
+            "Soak轮间隔(秒)": str(self.spin_soak_gap.value()),
+            "Soak流处理": self.combo_soak_clean.currentData(),
+            "Soak轮换用例": "开" if self.chk_soak_rotate.isChecked() else "关",
+            "并发线程数(workers)": str(self.spin_workers.value()),
+            "等待回复秒数(wait)": str(self.spin_wait.value()),
+            "远程执行": "开" if self.chk_remote.isChecked() else "关",
+            "远程主机": self.edit_host.text().strip(),
+            "远程目录": self.edit_remote_dir.text().strip(),
+        }
+        self.set_running(True)
+        self.tabs.setCurrentWidget(self.tab_log)
+        self.append_log(f"\n[SOAK] 稳定性测试开始: {', '.join(names)}，"
+                        f"{'轮数 ' + str(self.spin_soak_rounds.value()) + ' 轮' if self._soak_by_rounds() else '时长 ' + str(self.spin_soak_hours.value()) + 'h'}，"
+                        f"每轮 {self.spin_soak_batch.value()} 条，"
+                        f"流处理 {self.combo_soak_clean.currentData()}")
+        self._run_next_batch_item()
+
     def _download_config_for(self, name):
         """下载配置：stats JSON 始终下载(供汇总分析)；xlsx/运行日志仅在勾选“自动下载”时下载"""
         rd = self.edit_remote_dir.text().strip() + "/out"
         local_perf = self.edit_download_dir.text().strip() or \
                      os.path.join(BASE_DIR, "out", "performance")
+        if getattr(self, "_use_soak", False):
+            # 稳定性测试：下载 trend.csv / summary.json / soak.log（文件名平坦，单层即可）
+            return {"dirs": [{
+                "remote": rd + "/soak",
+                "local": os.path.join(os.path.dirname(local_perf), "soak"),
+                "patterns": [f"soak_{name}_*_trend.csv",
+                             f"soak_{name}_*_summary.json",
+                             f"soak_{name}_*_soak.log"],
+            }]}
         dirs = [
             {   # 汇总数据源：始终下载（小文件）
                 "remote": rd + "/performance",
@@ -1613,7 +1846,8 @@ class MainWindow(QWidget):
         if len(names) > 1:
             self.append_log(f"[BATCH] ({idx + 1}/{len(names)}) 接口 {name} 开始...")
 
-        cmd_str = self.build_send_cmd(name)
+        use_soak = getattr(self, "_use_soak", False)
+        cmd_str = self.build_soak_cmd(name) if use_soak else self.build_send_cmd(name)
         local_dl_dir = self.edit_download_dir.text().strip() or \
                        os.path.join(BASE_DIR, "out", "performance")
         dl = self._download_config_for(name)
@@ -1630,8 +1864,9 @@ class MainWindow(QWidget):
             self.worker.start()
         else:
             # 本地模式（.so 在 Linux 时才有真实发送）
-            args = cmd_str.split()[2:]   # 跳过 "python3 send_test.py"
-            cmd = [PYTHON, os.path.join(BASE_DIR, "send_test.py")] + args
+            script = "soak_test.py" if use_soak else "send_test.py"
+            args = cmd_str.split()[2:]   # 跳过 "python3 <脚本>"
+            cmd = [PYTHON, os.path.join(BASE_DIR, script)] + args
             self.worker = Worker(cmd, BASE_DIR, self)
             self.worker.line.connect(self.append_log)
             self.worker.finished.connect(lambda rc: self.on_batch_item_done(rc))
@@ -1650,6 +1885,7 @@ class MainWindow(QWidget):
             (os.path.join(BASE_DIR, "send_test.py"), f"{rd}/send_test.py"),
             (os.path.join(BASE_DIR, "mock_datahub.py"), f"{rd}/mock_datahub.py"),
             (os.path.join(BASE_DIR, "perf_stats.py"), f"{rd}/perf_stats.py"),
+            (os.path.join(BASE_DIR, "soak_test.py"), f"{rd}/soak_test.py"),
             (os.path.join(INTERFACES_DIR, "_common.py"), f"{rd}/interfaces/_common.py"),
             (os.path.join(INTERFACES_DIR, f"{name}.py"), f"{rd}/interfaces/{name}.py"),
             (os.path.join(DATA_DIR, f"{name}.xlsx"), f"{rd}/data/{name}.xlsx"),

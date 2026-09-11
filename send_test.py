@@ -929,6 +929,8 @@ def main():
     ap.add_argument("--no-send", action="store_true", help="只生成报文不发送")
     ap.add_argument("--quiet", action="store_true",
                     help="安静模式：不打印每条报文/回复，只输出关键信息")
+    ap.add_argument("--no-run-log", action="store_true",
+                    help="不写单轮运行日志文件（供 soak 稳定性测试复用，避免每轮一个日志）")
     args = ap.parse_args()
     global QUIET
     QUIET = args.quiet
@@ -949,13 +951,17 @@ def main():
         return
 
     # ---- 运行日志：tee stdout 到文件（排查问题用），统计明细最后追加 ----
-    run_dir = os.path.join(BASE_DIR, "out", "logs")
-    os.makedirs(run_dir, exist_ok=True)
-    # 多进程子进程各自带后缀，避免同一秒的并行进程互相覆盖运行日志
+    # --no-run-log：soak 稳定性测试下不写单轮日志（否则一晚上几千个文件）
     _run_suffix = os.environ.get("SEND_RUN_SUFFIX", "")
-    run_log = os.path.join(run_dir, f"{mod.NAME}{_run_suffix}_{time.strftime('%Y%m%d_%H%M%S')}.log")
     _orig_stdout = sys.stdout
-    sys.stdout = _Tee(_orig_stdout, open(run_log, "w", encoding="utf-8"))
+    if args.no_run_log:
+        run_log = None
+    else:
+        run_dir = os.path.join(BASE_DIR, "out", "logs")
+        os.makedirs(run_dir, exist_ok=True)
+        # 多进程子进程各自带后缀，避免同一秒的并行进程互相覆盖运行日志
+        run_log = os.path.join(run_dir, f"{mod.NAME}{_run_suffix}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        sys.stdout = _Tee(_orig_stdout, open(run_log, "w", encoding="utf-8"))
     _banner(f"[START] {mod.NAME} · send_test · {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     excel = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
@@ -1210,14 +1216,16 @@ def main():
                 for k, v in stats.summary().items():
                     print(f"  {k}: {v}")
                 # 按秒明细追加到运行日志
-                with open(run_log, "a", encoding="utf-8") as f:
-                    f.write(stats.detail_text())
-                    f.write("\n")
+                if run_log:
+                    with open(run_log, "a", encoding="utf-8") as f:
+                        f.write(stats.detail_text())
+                        f.write("\n")
             except Exception as e:
                 print(f"[WARN] 统计输出失败: {e}")
                 import traceback
                 traceback.print_exc()
-        print(f"[INFO] 运行日志已保存: {run_log}")
+        if run_log:
+            print(f"[INFO] 运行日志已保存: {run_log}")
         print("[INFO] 插件有后台线程，直接强制退出（跳过 DestroyMQ）")
         _banner(f"[END] {mod.NAME} · {time.strftime('%Y-%m-%d %H:%M:%S')}")
         sys.stdout.flush()
