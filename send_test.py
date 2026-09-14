@@ -194,29 +194,55 @@ def load_interface(name):
     return mod
 
 
-def load_cases(excel, max_cases):
-    # read_only 流式：万行大表（如 create 10k×92 列）非 read_only 会整表物化，加载耗时数秒
+def load_cases(excel, max_cases, want_types=None):
+    """读取 Excel 用例。
+
+    max_cases > 0 时提前终止：读够这么多"可用"用例就停，不再解析后续行。
+    万行大表（如 create 10k×85 列）实测 openpyxl 约 700 行/秒，全量读取要
+    14s+；只发少量用例（短测/--cases）时白等这部分时间。
+    want_types: 已选类型集合（如 {'normal'}）。提前终止时按过滤后的条数计数，
+                否则 --type normal --max 100 会被前面的 error/destroy 行提前填满。
+
+    注意：调用方若要用 --cases 按"Excel 原始行号"筛选，必须传 max_cases=0
+    （提前终止会打乱行号与数据的对应关系）。
+    """
+    # read_only 流式：万行大表非 read_only 会整表物化，加载耗时数秒
     wb = load_workbook(excel, read_only=True, data_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        sys.exit(f"[FAIL] {excel} 为空")
+    try:
+        ws = wb.active
+        # 不要 list(iter_rows())：那会强制读完整个表，read_only 的意义就没了
+        it = ws.iter_rows(values_only=True)
+        try:
+            header_row = next(it)
+        except StopIteration:
+            sys.exit(f"[FAIL] {excel} 为空")
 
-    def _key(h):
-        # 用 ASCII 限定，避免 \w 在 Unicode 模式下匹配到中文（如 "(逗号分隔)"）
-        m = re.search(r"\(([A-Za-z_][A-Za-z0-9_]*)\)", str(h))
-        return m.group(1) if m else str(h).strip()
+        def _key(h):
+            # 用 ASCII 限定，避免 \w 在 Unicode 模式下匹配到中文（如 "(逗号分隔)"）
+            m = re.search(r"\(([A-Za-z_][A-Za-z0-9_]*)\)", str(h))
+            return m.group(1) if m else str(h).strip()
 
-    headers = [_key(h) for h in rows[0]]
-    cases = []
-    for raw in rows[1:]:
-        if raw is None or all(v is None or str(v).strip() == "" for v in raw):
-            continue
-        rec = {headers[i]: ("" if raw[i] is None else raw[i]) for i in range(len(headers))}
-        rec["_no"] = rec.get("case_no") or f"C{len(cases) + 1}"
-        rec["_type"] = (rec.get("case_type") or "normal").strip().lower()
-        cases.append(rec)
-    return cases
+        headers = [_key(h) for h in header_row]
+        ncol = len(headers)
+        cases = []
+        n_hit = 0          # 满足 want_types 的条数（提前终止的判据）
+        for raw in it:
+            if raw is None or all(v is None or str(v).strip() == "" for v in raw):
+                continue
+            rec = {headers[i]: ("" if raw[i] is None else raw[i])
+                   for i in range(min(ncol, len(raw)))}
+            rec["_no"] = rec.get("case_no") or f"C{len(cases) + 1}"
+            rec["_type"] = (rec.get("case_type") or "normal").strip().lower()
+            cases.append(rec)
+            # 读够即停：只发少量用例时不必解析整表（万行大表约 700 行/秒）
+            if max_cases:
+                if not want_types or rec["_type"] in want_types:
+                    n_hit += 1
+                    if n_hit >= max_cases:
+                        break
+        return cases
+    finally:
+        wb.close()   # read_only 模式必须显式关闭，否则文件句柄泄漏
 
 
 def parse_case_spec(spec):
@@ -965,10 +991,19 @@ def main():
     _banner(f"[START] {mod.NAME} · send_test · {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     excel = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
-    cases = load_cases(excel, 0)   # 先读全部
+    # 提前终止条件：无 --cases（其按 Excel 原始行号/编号筛选，提前停会错位）
+    # 且 --max>0（0=全部，本就要读完整表）。want_types 让 --type 过滤后的条数达标即停。
+    _want = None
+    if args.type:
+        _want = {t.strip().lower() for t in args.type.split(",") if t.strip()}
+    _max_cases = args.max if (args.max > 0 and not args.cases.strip()) else 0
+    _t_read = time.time()
+    cases = load_cases(excel, _max_cases, want_types=_want)
+    _read_dt = time.time() - _t_read
     # 空数据必须在这里拦掉：否则下面 --max 循环扩量时 base 为空会陷入死循环
     if not cases:
         sys.exit(f"[FAIL] {excel} 中无有效用例（表头之后没有数据行）")
+    print(f"[INFO] 读取用例 {len(cases)} 条，耗时 {_read_dt:.2f}s")
     # --cases 过滤：按用例编号/行号指定发送（先于 --type，行号对齐 Excel 原始顺序）
     if args.cases.strip():
         try:
