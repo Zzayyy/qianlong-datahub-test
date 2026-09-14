@@ -988,6 +988,19 @@ def main():
         if not cases:
             sys.exit(f"[FAIL] 类型 {args.type} 过滤后无用例。"
                      f"可用类型: normal/probe/error/destroy")
+    # 破坏参数与用例类型不匹配时明确告警：--destroy-* 只对 destroy 用例生效，
+    # 若过滤后无 destroy 用例，这几个参数会被完全忽略（常见误配：--type normal
+    # 却带着 --destroy-via-plugin --destroy-mode type2，让人误以为在测破坏场景）
+    if args.type and (args.destroy_via_plugin or args.destroy_mode):
+        if not any(c["_type"] == "destroy" for c in cases):
+            _bad = []
+            if args.destroy_via_plugin:
+                _bad.append("--destroy-via-plugin")
+            if args.destroy_mode:
+                _bad.append(f"--destroy-mode {args.destroy_mode}")
+            print(f"[WARN] {' 与 '.join(_bad)} 已忽略："
+                  f"本次 --type {args.type} 无可用的 destroy 用例"
+                  f"（该参数仅对 destroy 用例生效）", flush=True)
     # --max 循环：过滤后再循环到 N 条（压测需要）
     if args.max > len(cases):
         base = cases[:]

@@ -765,11 +765,13 @@ class MainWindow(QWidget):
         # 默认全不勾选：压测/破坏分开展，避免误发 destroy 直写 Redis
         for cb in (self.chk_type_normal, self.chk_type_error, self.chk_type_destroy):
             type_box.addWidget(cb)
+            cb.toggled.connect(self._sync_destroy_controls)
         type_box.addStretch(1)
         g2.addLayout(type_box, 3, 1, 1, 3)
 
         # 行4：破坏测试类型（直写 Redis 时生效；两个维度组合：核心字段 × task 内容）
-        g2.addWidget(QLabel("破坏类型:"), 4, 0)
+        self.lbl_destroy_mode = QLabel("破坏类型:")
+        g2.addWidget(self.lbl_destroy_mode, 4, 0)
         self.combo_destroy_mode = QComboBox()
         self.combo_destroy_mode.addItem("type1 乱填字段+业务畸形 (测:路由+业务校验)", "type1")
         self.combo_destroy_mode.addItem("type2 乱填字段+业务正确 (测:路由)", "type2")
@@ -788,6 +790,7 @@ class MainWindow(QWidget):
             "mixed：四种按顺序轮发\n"
             "对比：error用例走插件，task合法且协议格式，只破坏④业务校验")
         g2.addWidget(self.combo_destroy_mode, 4, 1, 1, 3)
+        self._sync_destroy_controls()   # 破坏控件随「用例类型」联动置灰
 
         # 行5：用例编号筛选（--cases），定位中台挂掉时逐条/分段发送
         g2.addWidget(QLabel("用例编号:"), 5, 0)
@@ -1448,6 +1451,41 @@ class MainWindow(QWidget):
         self.run_local(cmds, on_done=lambda rc: self.update_excel_label())
 
     def selected_types(self):
+        """返回选中的用例类型列表（空 = 全部类型）"""
+        sel = []
+        if self.chk_type_normal.isChecked():
+            sel.append("normal")
+        if self.chk_type_error.isChecked():
+            sel.append("error")
+        if self.chk_type_destroy.isChecked():
+            sel.append("destroy")
+        return sel
+
+    def _destroy_relevant(self):
+        """破坏参数当前是否可能生效。
+
+        --destroy-* 只对 destroy 用例起作用。勾了「用例类型」但不含 destroy 时，
+        这些参数会被 send_test 完全忽略（曾出现 --type normal 却带 --destroy-mode
+        type2 的误配）；此时把相关控件置灰并说明原因。
+        未勾选任何类型 = 发全部（含 destroy），故视为相关。
+        """
+        sel = self.selected_types()
+        return (not sel) or ("destroy" in sel)
+
+    def _sync_destroy_controls(self):
+        """按「用例类型」是否含 destroy，启用/置灰破坏相关控件"""
+        rel = self._destroy_relevant()
+        for w in (getattr(self, "chk_destroy_plugin", None),
+                  getattr(self, "combo_destroy_mode", None),
+                  getattr(self, "lbl_destroy_mode", None)):
+            if w is not None:
+                w.setEnabled(rel)
+        if hasattr(self, "combo_destroy_mode"):
+            _base = self.combo_destroy_mode.toolTip().split("\n【")[0]
+            self.combo_destroy_mode.setToolTip(
+                _base if rel else
+                _base + "\n【当前「用例类型」未勾选 destroy → 此项不生效】\n"
+                        "该参数仅作用于 destroy 用例；若要测破坏场景，请勾选 destroy")
         """返回选中的用例类型列表"""
         sel = []
         if self.chk_type_normal.isChecked():
