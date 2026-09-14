@@ -420,6 +420,8 @@ DEFAULT_CONFIG = {
     "remote": "1",       # 启用远程执行
     "quiet": "1",        # 安静模式
     "cases": "",         # 用例编号筛选（空=全部）
+    "date_scope": "",    # 查询时间窗筛选：""=不限 / today / month / year（仅 query）
+    "accounts": "",      # 指定账号筛选（逗号分隔，空=全部）
     "ref_spec": "",      # set/modify/remove 生成 Excel 的引用单号区间（空=默认 normal 行）
     "bulk_accounts": "0",  # acc_sign 批量账号行数（N 行不同账号的正常数据；0=不启用）
     "bulk_start": "0",     # 批量账号起始序号（0=接口默认 011301）
@@ -606,6 +608,7 @@ class MainWindow(QWidget):
             chk = QCheckBox(name)
             chk.setChecked(False)             # 默认全不勾选，按需勾选再跑
             chk.toggled.connect(self.update_interfaces_label)
+            chk.toggled.connect(self._sync_date_scope_control)  # 时间窗仅 query 可用
             self.chk_ifaces[name] = chk
             g1.addWidget(chk, i // cols, i % cols)
         for c in range(cols):
@@ -814,8 +817,38 @@ class MainWindow(QWidget):
             "· 用于核对动态单号(__REFn__)展开、字段内容是否正确\n"
             "· 本地 Windows 没有 .so，不勾选也只会预览")
         g2.addWidget(self.chk_preview, 6, 0, 1, 4)
-        # 行7：多进程并行（--procs，每进程独立插件连接；突破单连接吞吐）
-        g2.addWidget(QLabel("并行进程数:"), 7, 0)
+        # 行7：查询时间窗（--date-scope，仅 query 类接口有意义）
+        # 按日查 Redis、按月/按年查库：压 Redis 时只发当日用例
+        self.lbl_date_scope = QLabel("查询时间窗:")
+        g2.addWidget(self.lbl_date_scope, 7, 0)
+        self.combo_date_scope = QComboBox()
+        self.combo_date_scope.addItem("不限", "")
+        self.combo_date_scope.addItem("当日(查Redis)", "today")
+        self.combo_date_scope.addItem("当月(查库)", "month")
+        self.combo_date_scope.addItem("当年(查库)", "year")
+        _ds = self.combo_date_scope.findData(self.cfg.get("date_scope", ""))
+        self.combo_date_scope.setCurrentIndex(_ds if _ds >= 0 else 0)
+        self.combo_date_scope.setToolTip(
+            "按 query 的 Begin/EndDate 时间窗筛选用例（仅 query 类接口适用）：\n"
+            "· 当日 = BeginDate/EndDate 均为 __TODAY__ 的用例（3334 条，查 Redis）\n"
+            "· 当月 / 当年 = 查数据库的用例\n"
+            "压测 Redis 时选「当日」，避免按月/按年的请求打到数据库。\n"
+            "留「不限」= 全部用例（含按月/按年）")
+        g2.addWidget(self.combo_date_scope, 7, 1)
+
+        # 行7 右半：账号筛选（--accounts）
+        g2.addWidget(QLabel("指定账号:"), 7, 2)
+        self.edit_accounts = QLineEdit(self.cfg.get("accounts", ""))
+        self.edit_accounts.setPlaceholderText("如 010100011301,010100011304（空=全部）")
+        self.edit_accounts.setToolTip(
+            "只发指定账号的用例（精确匹配 Excel「云单账号」列，逗号分隔）。\n"
+            "与「查询时间窗」可叠加：如只发某几个账号的当日查询。\n"
+            "未匹配到的账号会在日志里 WARN 提示")
+        g2.addWidget(self.edit_accounts, 7, 3)
+        self._sync_date_scope_control()   # 时间窗随勾选的接口联动
+
+        # 行8：多进程并行（--procs，每进程独立插件连接；突破单连接吞吐）
+        g2.addWidget(QLabel("并行进程数:"), 8, 0)
         self.spin_procs = QSpinBox()
         self.spin_procs.setRange(1, 32)
         self.spin_procs.setValue(int(self.cfg.get("procs", "1")))
@@ -823,9 +856,9 @@ class MainWindow(QWidget):
             "把用例自动按行号均分到 N 个进程，各进程独立 CreateMQ/插件连接并行发送，"
             "用于突破单插件连接吞吐瓶颈（如 10000 条/秒目标）；需远程 Linux + .so。\n"
             "并行时\"最多条数\"按全部进程合计均分，不会发成 N×max")
-        g2.addWidget(self.spin_procs, 7, 1, 1, 3)
+        g2.addWidget(self.spin_procs, 8, 1, 1, 3)
 
-        # 行8：稳定性测试(Soak) 开关 —— 长时间连续跑 + 趋势聚合（由“运行稳定性测试”按钮触发）
+        # 行9：稳定性测试(Soak) 开关 —— 长时间连续跑 + 趋势聚合（由“运行稳定性测试”按钮触发）
         self.chk_soak = QCheckBox("稳定性测试(Soak，长时间连续跑/趋势汇总)")
         self.chk_soak.setChecked(self.cfg.get("soak", "0") == "1")
         self.chk_soak.setToolTip(
@@ -834,7 +867,7 @@ class MainWindow(QWidget):
             "· 结束条件可选：按时长（默认 8 小时）或按轮数（短测用，跑够 N 轮自动收尾）\n"
             "· 只输出 trend.csv / summary.json / soak.log（避免海量日志/表格）\n"
             "· 需远程 Linux + .so；本地 Windows 无法真实发送")
-        g2.addWidget(self.chk_soak, 8, 0, 1, 4)
+        g2.addWidget(self.chk_soak, 9, 0, 1, 4)
 
         # 行9-11：Soak 参数区 —— 独立容器，随「稳定性测试」勾选显示/隐藏（方案B）
         self.soak_params = QWidget()
@@ -892,7 +925,7 @@ class MainWindow(QWidget):
         self.spin_soak_gap.setToolTip("每轮之间的停顿秒数")
         gs.addWidget(self.spin_soak_gap, 11, 3)
 
-        g2.addWidget(self.soak_params, 9, 0, 1, 4)
+        g2.addWidget(self.soak_params, 10, 0, 1, 4)
         # 勾选切换时展开/收起参数区；并同步时长/轮数的启用状态
         self.chk_soak.toggled.connect(self._sync_soak_visibility)
         self._sync_soak_visibility()
@@ -1140,6 +1173,28 @@ class MainWindow(QWidget):
         else:
             text = "未选择任何接口"
         self.lbl_excel.setText(text)
+
+    def _sync_date_scope_control(self):
+        """「查询时间窗」只在勾选了 query 时可用（仅 query 的 Excel 有日期列）。
+
+        未勾选任何接口时保持可用（用户可能先设参数再勾接口）。
+        """
+        if not hasattr(self, "combo_date_scope"):
+            return
+        sel = self.selected_interfaces()
+        usable = (not sel) or ("query" in sel)
+        self.combo_date_scope.setEnabled(usable)
+        if hasattr(self, "lbl_date_scope"):
+            self.lbl_date_scope.setEnabled(usable)
+        _base = ("按 query 的 Begin/EndDate 时间窗筛选用例（仅 query 类接口适用）：\n"
+                 "· 当日 = BeginDate/EndDate 均为 __TODAY__ 的用例（3334 条，查 Redis）\n"
+                 "· 当月 / 当年 = 查数据库的用例\n"
+                 "压测 Redis 时选「当日」，避免按月/按年的请求打到数据库。\n"
+                 "留「不限」= 全部用例（含按月/按年）")
+        self.combo_date_scope.setToolTip(
+            _base if usable else
+            _base + "\n【当前未勾选 query 接口 → 此项不生效】\n"
+                    "只有 query 的表有 BeginDate/EndDate 列；其他接口用了会过滤成 0 条")
 
     def update_excel_label(self):
         self.update_interfaces_label()
@@ -1511,6 +1566,14 @@ class MainWindow(QWidget):
         if cases_spec:
             parts.append("--cases")
             parts.append(cases_spec)
+        _ds = self.combo_date_scope.currentData()
+        if _ds:                       # "" = 不限，不传
+            parts.append("--date-scope")
+            parts.append(_ds)
+        _acc = self.edit_accounts.text().strip()
+        if _acc:
+            parts.append("--accounts")
+            parts.append(_acc)
         if self.chk_preview.isChecked():
             parts.append("--no-send")
         if self.chk_mock.isChecked():
@@ -1629,6 +1692,8 @@ class MainWindow(QWidget):
             "mock": "1" if self.chk_mock.isChecked() else "0",
             "quiet": "1" if self.chk_quiet.isChecked() else "0",
             "cases": self.edit_cases.text().strip(),
+            "date_scope": self.combo_date_scope.currentData() or "",
+            "accounts": self.edit_accounts.text().strip(),
             "ref_spec": self.edit_ref.text().strip(),
             "bulk_accounts": str(self.spin_bulk_accounts.value()),
             "bulk_start": str(self.spin_bulk_start.value()),

@@ -194,18 +194,41 @@ def load_interface(name):
     return mod
 
 
-def load_cases(excel, max_cases, want_types=None):
-    """读取 Excel 用例。
+def load_cases(excel, max_cases, want_types=None, date_scope=""):
+    """读取 Excel 用例，并按 want_types / date_scope 过滤后返回。
 
-    max_cases > 0 时提前终止：读够这么多"可用"用例就停，不再解析后续行。
+    max_cases > 0 时提前终止：读够这么多"已过滤"用例就停，不再解析后续行。
     万行大表（如 create 10k×85 列）实测 openpyxl 约 700 行/秒，全量读取要
     14s+；只发少量用例（短测/--cases）时白等这部分时间。
-    want_types: 已选类型集合（如 {'normal'}）。提前终止时按过滤后的条数计数，
-                否则 --type normal --max 100 会被前面的 error/destroy 行提前填满。
+
+    want_types: 已选类型集合（如 {'normal'}）；None/空 = 不过滤。
+                参与过滤与提前终止计数，否则 --type normal --max 100 会被
+                前面的 error/destroy 行提前填满。
+    date_scope: 'today'/'month'/'year'，按 query 的 BeginDate/EndDate 占位符
+                过滤（在 __TODAY__ 展开成具体日期之前按原始值判断）。
+                today=按日查询（查 Redis）；month/year=查数据库。
+                参与过滤与提前终止计数。
 
     注意：调用方若要用 --cases 按"Excel 原始行号"筛选，必须传 max_cases=0
     （提前终止会打乱行号与数据的对应关系）。
     """
+    _SCOPE = {
+        "today": ("__TODAY__", "__TODAY__"),
+        "month": ("__MONTH_START__", "__MONTH_END__"),
+        "year": ("__YEAR_START__", "__YEAR_END__"),
+    }
+    _scope_pair = _SCOPE.get(date_scope or "")
+
+    def _hits(rec):
+        """该条是否同时满足类型与时间窗条件（过滤 + 提前终止计数共用）"""
+        if want_types and rec["_type"] not in want_types:
+            return False
+        if _scope_pair:
+            if (str(rec.get("BeginDate") or "").strip().upper() != _scope_pair[0]
+                    or str(rec.get("EndDate") or "").strip().upper() != _scope_pair[1]):
+                return False
+        return True
+
     # read_only 流式：万行大表非 read_only 会整表物化，加载耗时数秒
     wb = load_workbook(excel, read_only=True, data_only=True)
     try:
@@ -225,7 +248,6 @@ def load_cases(excel, max_cases, want_types=None):
         headers = [_key(h) for h in header_row]
         ncol = len(headers)
         cases = []
-        n_hit = 0          # 满足 want_types 的条数（提前终止的判据）
         for raw in it:
             if raw is None or all(v is None or str(v).strip() == "" for v in raw):
                 continue
@@ -233,13 +255,14 @@ def load_cases(excel, max_cases, want_types=None):
                    for i in range(min(ncol, len(raw)))}
             rec["_no"] = rec.get("case_no") or f"C{len(cases) + 1}"
             rec["_type"] = (rec.get("case_type") or "normal").strip().lower()
+            # 过滤在读取阶段完成：既保证返回的就是最终结果，也让提前终止的
+            # 计数天然等于"已过滤条数"（不必再让调用方重复过滤一遍）
+            if not _hits(rec):
+                continue
             cases.append(rec)
             # 读够即停：只发少量用例时不必解析整表（万行大表约 700 行/秒）
-            if max_cases:
-                if not want_types or rec["_type"] in want_types:
-                    n_hit += 1
-                    if n_hit >= max_cases:
-                        break
+            if max_cases and len(cases) >= max_cases:
+                break
         return cases
     finally:
         wb.close()   # read_only 模式必须显式关闭，否则文件句柄泄漏
@@ -926,6 +949,15 @@ def main():
                          "C 编号按用例编号列匹配（如 C1,C3-C10），"
                          "纯数字按 Excel 数据行号匹配（1 起始，如 5-20）；"
                          "逗号分隔可混用，空=全部")
+    ap.add_argument("--date-scope", default="",
+                    choices=["", "today", "month", "year"],
+                    help="按查询时间窗筛选用例（仅 query 类接口有意义）："
+                         "today=只发 BeginDate/EndDate 为 __TODAY__ 的用例（按日查 Redis）；"
+                         "month=当月；year=当年。空=不筛选。"
+                         "注意：按 Excel 原始占位符判断，在 __TODAY__ 展开成具体日期之前")
+    ap.add_argument("--accounts", default="",
+                    help="只发指定账号的用例（匹配 Excel「云单账号」列，逗号分隔）："
+                         "如 010100011301,010100011304。空=全部")
     ap.add_argument("--wait", type=float, default=3.0, help="发完后等待回复秒数")
     ap.add_argument("--reply", type=int, default=0, choices=[0, 1], help="reply_flag")
     ap.add_argument("--init-wait", type=float, default=5.0, help="等待插件 inited 最大秒数(兜底超时，正常2-3s即探测到)")
@@ -991,14 +1023,19 @@ def main():
     _banner(f"[START] {mod.NAME} · send_test · {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     excel = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
-    # 提前终止条件：无 --cases（其按 Excel 原始行号/编号筛选，提前停会错位）
-    # 且 --max>0（0=全部，本就要读完整表）。want_types 让 --type 过滤后的条数达标即停。
-    _want = None
-    if args.type:
-        _want = {t.strip().lower() for t in args.type.split(",") if t.strip()}
-    _max_cases = args.max if (args.max > 0 and not args.cases.strip()) else 0
+    # 读取期过滤+提前终止的启用条件：无 --cases。
+    # --cases 按"Excel 原始行号/编号"筛选，读取期先过滤会让行号与原始顺序错位，
+    # 故该场景必须全量读取（_pass_types/_pass_scope 传空），过滤留给下游。
+    _by_cases = bool(args.cases.strip())
+    _pass_types = None
+    if args.type and not _by_cases:
+        _pass_types = {t.strip().lower() for t in args.type.split(",") if t.strip()}
+    _pass_scope = "" if _by_cases else args.date_scope
+    # --max>0 才提前终止；0=全部，本就要读完整表
+    _max_cases = args.max if (args.max > 0 and not _by_cases) else 0
     _t_read = time.time()
-    cases = load_cases(excel, _max_cases, want_types=_want)
+    cases = load_cases(excel, _max_cases, want_types=_pass_types,
+                       date_scope=_pass_scope)
     _read_dt = time.time() - _t_read
     # 空数据必须在这里拦掉：否则下面 --max 循环扩量时 base 为空会陷入死循环
     if not cases:
@@ -1036,6 +1073,44 @@ def main():
             print(f"[WARN] {' 与 '.join(_bad)} 已忽略："
                   f"本次 --type {args.type} 无可用的 destroy 用例"
                   f"（该参数仅对 destroy 用例生效）", flush=True)
+    # --date-scope：按查询时间窗筛选（在 __TODAY__ 展开成具体日期之前按原始占位符判断）
+    # query 的按日查询查 Redis、按月/按年查数据库，压测 Redis 时需只发当日用例
+    if args.date_scope:
+        _SCOPE = {
+            "today": ("__TODAY__", "__TODAY__"),
+            "month": ("__MONTH_START__", "__MONTH_END__"),
+            "year": ("__YEAR_START__", "__YEAR_END__"),
+        }
+        _want_b, _want_e = _SCOPE[args.date_scope]
+
+        def _norm(v):
+            return str(v or "").strip().upper()
+
+        _before = len(cases)
+        cases = [c for c in cases
+                 if _norm(c.get("BeginDate")) == _want_b
+                 and _norm(c.get("EndDate")) == _want_e]
+        if not cases:
+            sys.exit(f"[FAIL] --date-scope {args.date_scope} 过滤后无用例"
+                     f"（需 BeginDate={_want_b} 且 EndDate={_want_e}，"
+                     f"该参数仅对 query 类接口有意义）")
+        print(f"[INFO] 时间窗筛选 --date-scope {args.date_scope}: "
+              f"{_before} -> {len(cases)} 条"
+              f"（{_want_b} ~ {_want_e}）")
+
+    # --accounts：按「云单账号」列筛选（逗号分隔，精确匹配）
+    if args.accounts.strip():
+        _accs = {a.strip() for a in args.accounts.split(",") if a.strip()}
+        _before = len(cases)
+        cases = [c for c in cases if str(c.get("FAccount") or "").strip() in _accs]
+        if not cases:
+            sys.exit(f"[FAIL] --accounts 未匹配到任何用例：{','.join(sorted(_accs))}")
+        _miss = _accs - {str(c.get("FAccount") or "").strip() for c in cases}
+        if _miss:
+            print(f"[WARN] 以下账号无匹配用例: {','.join(sorted(_miss))}")
+        print(f"[INFO] 账号筛选 --accounts: {_before} -> {len(cases)} 条"
+              f"（{len(_accs) - len(_miss)}/{len(_accs)} 个账号命中）")
+
     # --max 循环：过滤后再循环到 N 条（压测需要）
     if args.max > len(cases):
         base = cases[:]
