@@ -105,8 +105,15 @@ def apply_ref_map(rows, fa_i, ref_i, refmap):
         else:
             miss += 1
         out.append(tuple(row))
+    hit = len(rows) - miss
     if miss:
-        print(f"[WARN] {miss} 行账号未在回填映射中，保留原 __REF__ token")
+        print(f"[WARN] {miss}/{len(rows)} 行账号未在回填映射中，保留原 __REF__ token")
+    if rows and hit == 0:
+        # 全 miss 说明账号体系完全对不上（常见于误加 --bulk-start），
+        # 此时生成的用例发出去会引用不存在的单号，必须显式点出来
+        print("[ERROR] 全部行都未命中回填映射 —— 生成的 Refs 仍是 __REF__ token！\n"
+              "        常见原因：加了 --bulk-start 改变了账号起点，与 create 的账号序列错位。\n"
+              "        请去掉 --bulk-start 重试（create 默认账号序列即为 011301 起）。")
     return out
 
 
@@ -176,13 +183,25 @@ def main():
                          "第 i 行引用 __REF{ref_seq+i}__，与 create 行序对齐）")
     ap.add_argument("--ref-map", default="",
                     help="彻底稳回填：传入 create 返回 Ref 的落盘 JSON（账号→Ref 映射），"
-                         "set/modify/remove 批量行的 Ref 用真实单号静态填回，不再依赖顺序假设")
+                         "把 --bulk-normal 生成行的 Ref 用真实单号静态填回，不再依赖顺序假设。"
+                         "【必须与 --bulk-normal 配合】单独用 --ref-spec 时账号对不上，回填无效。"
+                         "不要再用 --bulk-start 改账号起点，否则与 create 的账号序列错位。"
+                         "例：--bulk-normal 10000 --ref-map out/performance/create_xxx_refs.json")
     args = ap.parse_args()
 
     mod = load_interface(args.interface)
 
     # ---- 引用单号区间：替换 normal 为按号生成的引用行 ----
     if args.ref_spec:
+        # --ref-map 的回填逻辑只作用于 --bulk-normal 生成的行（按账号查 Ref）。
+        # --ref-spec 生成的行账号固定，账号对不上 refs.json，回填必然全部 miss，
+        # 结果静默保留 __REF token（用户以为填了真实单号）——这里直接拦掉。
+        if args.ref_map:
+            sys.exit(
+                "[FAIL] --ref-map 不能与 --ref-spec 同时使用：\n"
+                "       --ref-map 按「账号→Ref」回填，需配合 --bulk-normal（生成多账号行）；\n"
+                "       --ref-spec 生成的行账号固定，与 refs.json 的账号对不上，回填会全部失败。\n"
+                "       正确用法: --bulk-normal <条数> --ref-map <refs.json>")
         try:
             extra = build_ref_rows(mod, args.ref_spec)
         except ValueError as e:

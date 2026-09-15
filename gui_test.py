@@ -669,7 +669,13 @@ class MainWindow(QWidget):
         self.edit_ref_map.setPlaceholderText("Ref回填文件 *_refs.json (可选)")
         self.edit_ref_map.setToolTip(
             "传 create 返回 Ref 的落盘 JSON（out/performance/*_refs.json），"
-            "生成 set/modify/remove 时按账号把 __REF token 替换成中台真实单号——彻底稳，不依赖顺序假设")
+            "生成 set/modify/remove 时按账号把 __REF token 替换成中台真实单号——彻底稳，不依赖顺序假设。\n"
+            "\n"
+            "【用法】填此项时，「批量账号数」必须填 create 造单的数量（如 10000），\n"
+            "且「账号起始序号」保持 0 —— 回填是拿「账号」去 refs.json 里查单号的，\n"
+            "账号序列一旦错位就会全部查不到、Refs 仍是 __REF token。\n"
+            "\n"
+            "注意：此项只在「批量账号数」>0 时生效；只填「引用单号区间」时账号固定，回填无效。")
         refmap_row.addWidget(self.edit_ref_map, 1)
         self.btn_pick_ref_map = QPushButton("浏览…")
         self.btn_pick_ref_map.clicked.connect(self._pick_ref_map_file)
@@ -1487,6 +1493,34 @@ class MainWindow(QWidget):
             return
         ref_spec = self.edit_ref.text().strip()
         bulk_n = self.spin_bulk_accounts.value()
+        ref_map = self.edit_ref_map.text().strip()
+        # ---- 生成前的参数一致性校验（避免生成出无效数据却毫无察觉）----
+        _ref_ifaces = [n for n in names if n in ("set", "modify", "remove")]
+        if ref_map and _ref_ifaces:
+            if not bulk_n:
+                QMessageBox.warning(
+                    self, "参数不匹配",
+                    "填了「Ref回填文件」但「批量账号数」为 0。\n\n"
+                    "Ref 回填是按「账号」去 refs.json 里查真实单号的，"
+                    "需要配合「批量账号数」生成多账号行才生效。\n\n"
+                    "请把「批量账号数」设为 create 造单的数量（如 10000）后重试。")
+                return
+            if self.spin_bulk_start.value() != 0:
+                r = QMessageBox.warning(
+                    self, "可能生成无效数据",
+                    f"「账号起始序号」当前为 {self.spin_bulk_start.value()}（非 0）。\n\n"
+                    "这会改变生成的账号序列，导致与 create 的账号对不上，"
+                    "Ref 回填将全部失败、Refs 列仍是 __REF token。\n\n"
+                    "确定仍要继续吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No)
+                if r != QMessageBox.StandardButton.Yes:
+                    return
+        if ref_map and not _ref_ifaces:
+            QMessageBox.information(
+                self, "提示",
+                "「Ref回填文件」只对 set / modify / remove 生效，"
+                f"当前勾选的接口（{'、'.join(names)}）用不到，将被忽略。")
         cmds = []
         for n in names:
             cmd = [PYTHON, os.path.join(BASE_DIR, "make_excel.py"), "--interface", n]
@@ -1499,7 +1533,6 @@ class MainWindow(QWidget):
                 cmd += ["--bulk-normal", str(bulk_n),
                         "--bulk-start", str(self.spin_bulk_start.value())]
                 # Ref 回填：create 落盘的真实单号（彻底稳，仅 set/modify/remove）
-                ref_map = self.edit_ref_map.text().strip()
                 if ref_map and n in ("set", "modify", "remove"):
                     cmd += ["--ref-map", ref_map]
             cmds.append(cmd)
