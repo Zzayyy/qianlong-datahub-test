@@ -420,6 +420,9 @@ DEFAULT_CONFIG = {
     "remote": "1",       # 启用远程执行
     "quiet": "1",        # 安静模式
     "cases": "",         # 用例编号筛选（空=全部）
+    "end_mode": "count", # 结束条件：count=按条数 / time=按时间（--seconds）
+    "seconds": "10",     # 按时间模式的运行秒数
+    "persec_csv": "0",   # 是否导出按秒明细 CSV（--per-sec-csv）
     "date_scope": "",    # 查询时间窗筛选：""=不限 / today / month / year（仅 query）
     "accounts": "",      # 指定账号筛选（逗号分隔，空=全部）
     "ref_spec": "",      # set/modify/remove 生成 Excel 的引用单号区间（空=默认 normal 行）
@@ -726,47 +729,75 @@ class MainWindow(QWidget):
         g2.setColumnStretch(1, 1)
         g2.setColumnStretch(3, 1)
 
-        # 行0：压测规模（并发 / 条数）
+        # 行0：压测规模（并发 / 结束条件）
         g2.addWidget(QLabel("并发线程数:"), 0, 0)
         self.spin_workers = QSpinBox()
         self.spin_workers.setRange(1, 500)
         self.spin_workers.setValue(int(self.cfg.get("workers", "4")))
         g2.addWidget(self.spin_workers, 0, 1)
 
+        g2.addWidget(QLabel("结束条件:"), 0, 2)
+        self.combo_end_mode = QComboBox()
+        self.combo_end_mode.addItem("按条数", "count")
+        self.combo_end_mode.addItem("按时间", "time")
+        _em = self.combo_end_mode.findData(self.cfg.get("end_mode", "count"))
+        self.combo_end_mode.setCurrentIndex(_em if _em >= 0 else 0)
+        self.combo_end_mode.setToolTip(
+            "按条数：发够「最多条数」就停（传统压测方式）\n"
+            "按时间：跑够「运行秒数」就停，用例发完自动循环续发——\n"
+            "  适合测持续写入能力，配合「导出按秒明细」可看出速率随时间的变化")
+        g2.addWidget(self.combo_end_mode, 0, 3)
+
+        # 行0b：条数 / 秒数 两个输入框并排，按结束条件启用其一
         self.lbl_max = QLabel("最多条数(0=全部):")
-        g2.addWidget(self.lbl_max, 0, 2)
+        g2.addWidget(self.lbl_max, 1, 0)
         self.spin_max = QSpinBox()
         self.spin_max.setRange(0, 10000000)
         self.spin_max.setValue(int(self.cfg.get("max", "0")))
         self.spin_max.setToolTip(
             "总条数上限（0=全部）。注意：并行进程数>1 时，此值为全部进程合计条数，"
             "会按进程均分；不会每个进程都发满 N 次\n"
-            "勾选「稳定性测试(Soak)」时此项不生效：每轮条数由「Soak每轮条数」决定")
-        g2.addWidget(self.spin_max, 0, 3)
+            "【结束条件=按条数时生效】按时间模式下改由「运行秒数」决定"
+        )
+        g2.addWidget(self.spin_max, 1, 1)
 
-        # 行1：等待回复 / 安静模式
-        g2.addWidget(QLabel("等待回复秒数:"), 1, 0)
+        self.lbl_seconds = QLabel("运行秒数:")
+        g2.addWidget(self.lbl_seconds, 1, 2)
+        self.spin_seconds = QDoubleSpinBox()
+        self.spin_seconds.setRange(0.5, 86400)
+        self.spin_seconds.setDecimals(1)
+        self.spin_seconds.setValue(float(self.cfg.get("seconds", "10")))
+        self.spin_seconds.setToolTip(
+            "持续发送的秒数（到点即停并收尾在飞请求）。\n"
+            "用例发完后会自动从头循环续发（此时单号会重复，仅用于压流量）。\n"
+            "建议配合「导出按秒明细」看每秒实际条数与延迟走势")
+        g2.addWidget(self.spin_seconds, 1, 3)
+        self.combo_end_mode.currentIndexChanged.connect(self._sync_end_mode)
+        self._sync_end_mode()
+
+        # 行2：等待回复 / 安静模式
+        g2.addWidget(QLabel("等待回复秒数:"), 2, 0)
         self.spin_wait = QDoubleSpinBox()
         # 等待回复不限 300s：支持到一天（86400s），足够长压测收齐回复
         self.spin_wait.setRange(0, 86400)
         self.spin_wait.setValue(float(self.cfg.get("wait", "5.0")))
-        g2.addWidget(self.spin_wait, 1, 1)
+        g2.addWidget(self.spin_wait, 2, 1)
 
         self.chk_quiet = QCheckBox("安静模式 (批量压测建议勾选，减少日志)")
         self.chk_quiet.setChecked(self.cfg.get("quiet", "1") == "1")
-        g2.addWidget(self.chk_quiet, 1, 2, 1, 2)
+        g2.addWidget(self.chk_quiet, 2, 2, 1, 2)
 
-        # 行2：发送模式开关
+        # 行3：发送模式开关
         self.chk_mock = QCheckBox("模拟数据中台应答器 (mock)")
         self.chk_mock.setChecked(self.cfg.get("mock", "1") == "1")
-        g2.addWidget(self.chk_mock, 2, 0, 1, 2)
+        g2.addWidget(self.chk_mock, 3, 0, 1, 2)
 
         self.chk_destroy_plugin = QCheckBox("破坏数据走插件 (默认直写 Redis)")
         self.chk_destroy_plugin.setChecked(self.cfg.get("destroy_via_plugin", "0") == "1")
-        g2.addWidget(self.chk_destroy_plugin, 2, 2, 1, 2)
+        g2.addWidget(self.chk_destroy_plugin, 3, 2, 1, 2)
 
-        # 行3：用例类型过滤（--type）
-        g2.addWidget(QLabel("用例类型:"), 3, 0)
+        # 行4：用例类型过滤（--type）
+        g2.addWidget(QLabel("用例类型:"), 4, 0)
         type_box = QHBoxLayout()
         self.chk_type_normal = QCheckBox("normal")
         self.chk_type_error = QCheckBox("error")
@@ -776,11 +807,11 @@ class MainWindow(QWidget):
             type_box.addWidget(cb)
             cb.toggled.connect(self._sync_destroy_controls)
         type_box.addStretch(1)
-        g2.addLayout(type_box, 3, 1, 1, 3)
+        g2.addLayout(type_box, 4, 1, 1, 3)
 
-        # 行4：破坏测试类型（直写 Redis 时生效；两个维度组合：核心字段 × task 内容）
+        # 行5：破坏测试类型（直写 Redis 时生效；两个维度组合：核心字段 × task 内容）
         self.lbl_destroy_mode = QLabel("破坏类型:")
-        g2.addWidget(self.lbl_destroy_mode, 4, 0)
+        g2.addWidget(self.lbl_destroy_mode, 5, 0)
         self.combo_destroy_mode = QComboBox()
         self.combo_destroy_mode.addItem("type1 乱填字段+业务畸形 (测:路由+业务校验)", "type1")
         self.combo_destroy_mode.addItem("type2 乱填字段+业务正确 (测:路由)", "type2")
@@ -798,11 +829,11 @@ class MainWindow(QWidget):
             "type4：核心字段正常 + task合法JSON但非协议格式 —— 破坏③，测未知结构的分发容错\n"
             "mixed：四种按顺序轮发\n"
             "对比：error用例走插件，task合法且协议格式，只破坏④业务校验")
-        g2.addWidget(self.combo_destroy_mode, 4, 1, 1, 3)
+        g2.addWidget(self.combo_destroy_mode, 5, 1, 1, 3)
         self._sync_destroy_controls()   # 破坏控件随「用例类型」联动置灰
 
-        # 行5：用例编号筛选（--cases），定位中台挂掉时逐条/分段发送
-        g2.addWidget(QLabel("用例编号:"), 5, 0)
+        # 行6：用例编号筛选（--cases），定位中台挂掉时逐条/分段发送
+        g2.addWidget(QLabel("用例编号:"), 6, 0)
         self.edit_cases = QLineEdit(self.cfg.get("cases", ""))
         self.edit_cases.setPlaceholderText("如 C1,C3-C10 或 5-20（空=全部）")
         self.edit_cases.setToolTip(
@@ -812,9 +843,9 @@ class MainWindow(QWidget):
             "· 逗号分隔可混用：C1,C3-C10,25\n"
             "· 与「用例类型」叠加过滤；留空发全部\n"
             "查看发送的报文：关掉安静模式可逐条打印；--no-send 预览可存 out/{接口}_requests.jsonl")
-        g2.addWidget(self.edit_cases, 5, 1, 1, 3)
+        g2.addWidget(self.edit_cases, 6, 1, 1, 3)
 
-        # 行6：预览模式（--no-send，只生成报文不发送）
+        # 行7：预览模式（--no-send，只生成报文不发送）
         self.chk_preview = QCheckBox("预览模式 (只生成报文不发送，存 out/{接口}_requests.jsonl)")
         self.chk_preview.setChecked(self.cfg.get("preview", "0") == "1")
         self.chk_preview.setToolTip(
@@ -822,11 +853,19 @@ class MainWindow(QWidget):
             "· 远程执行时也在远程生成 jsonl 并自动下载到本地 out/requests/\n"
             "· 用于核对动态单号(__REFn__)展开、字段内容是否正确\n"
             "· 本地 Windows 没有 .so，不勾选也只会预览")
-        g2.addWidget(self.chk_preview, 6, 0, 1, 4)
-        # 行7：查询时间窗（--date-scope，仅 query 类接口有意义）
+        g2.addWidget(self.chk_preview, 7, 0, 1, 2)
+        # 行7 右半：按秒明细 CSV（配合「结束条件=按时间」看速率曲线）
+        self.chk_persec_csv = QCheckBox("导出按秒明细CSV")
+        self.chk_persec_csv.setChecked(self.cfg.get("persec_csv", "0") == "1")
+        self.chk_persec_csv.setToolTip(
+            "额外导出 <接口>_<时间>_persec.csv：每秒的请求数/字节/失败/CPU/流增量/平均延迟。\n"
+            "可直接画速率曲线，定位「第几秒开始掉速」。\n"
+            "配合「结束条件=按时间」使用效果最好（能看出速率随时间的变化）")
+        g2.addWidget(self.chk_persec_csv, 7, 2, 1, 2)
+        # 行8：查询时间窗（--date-scope，仅 query 类接口有意义）
         # 按日查 Redis、按月/按年查库：压 Redis 时只发当日用例
         self.lbl_date_scope = QLabel("查询时间窗:")
-        g2.addWidget(self.lbl_date_scope, 7, 0)
+        g2.addWidget(self.lbl_date_scope, 8, 0)
         self.combo_date_scope = QComboBox()
         self.combo_date_scope.addItem("不限", "")
         self.combo_date_scope.addItem("当日(查Redis)", "today")
@@ -840,21 +879,21 @@ class MainWindow(QWidget):
             "· 当月 / 当年 = 查数据库的用例\n"
             "压测 Redis 时选「当日」，避免按月/按年的请求打到数据库。\n"
             "留「不限」= 全部用例（含按月/按年）")
-        g2.addWidget(self.combo_date_scope, 7, 1)
+        g2.addWidget(self.combo_date_scope, 8, 1)
 
-        # 行7 右半：账号筛选（--accounts）
-        g2.addWidget(QLabel("指定账号:"), 7, 2)
+        # 行8 右半：账号筛选（--accounts）
+        g2.addWidget(QLabel("指定账号:"), 8, 2)
         self.edit_accounts = QLineEdit(self.cfg.get("accounts", ""))
         self.edit_accounts.setPlaceholderText("如 010100011301,010100011304（空=全部）")
         self.edit_accounts.setToolTip(
             "只发指定账号的用例（精确匹配 Excel「云单账号」列，逗号分隔）。\n"
             "与「查询时间窗」可叠加：如只发某几个账号的当日查询。\n"
             "未匹配到的账号会在日志里 WARN 提示")
-        g2.addWidget(self.edit_accounts, 7, 3)
+        g2.addWidget(self.edit_accounts, 8, 3)
         self._sync_date_scope_control()   # 时间窗随勾选的接口联动
 
-        # 行8：多进程并行（--procs，每进程独立插件连接；突破单连接吞吐）
-        g2.addWidget(QLabel("并行进程数:"), 8, 0)
+        # 行9：多进程并行（--procs，每进程独立插件连接；突破单连接吞吐）
+        g2.addWidget(QLabel("并行进程数:"), 9, 0)
         self.spin_procs = QSpinBox()
         self.spin_procs.setRange(1, 32)
         self.spin_procs.setValue(int(self.cfg.get("procs", "1")))
@@ -862,7 +901,7 @@ class MainWindow(QWidget):
             "把用例自动按行号均分到 N 个进程，各进程独立 CreateMQ/插件连接并行发送，"
             "用于突破单插件连接吞吐瓶颈（如 10000 条/秒目标）；需远程 Linux + .so。\n"
             "并行时\"最多条数\"按全部进程合计均分，不会发成 N×max")
-        g2.addWidget(self.spin_procs, 8, 1, 1, 3)
+        g2.addWidget(self.spin_procs, 9, 1, 1, 3)
 
         # 行9：稳定性测试(Soak) 开关 —— 长时间连续跑 + 趋势聚合（由“运行稳定性测试”按钮触发）
         self.chk_soak = QCheckBox("稳定性测试(Soak，长时间连续跑/趋势汇总)")
@@ -873,9 +912,9 @@ class MainWindow(QWidget):
             "· 结束条件可选：按时长（默认 8 小时）或按轮数（短测用，跑够 N 轮自动收尾）\n"
             "· 只输出 trend.csv / summary.json / soak.log（避免海量日志/表格）\n"
             "· 需远程 Linux + .so；本地 Windows 无法真实发送")
-        g2.addWidget(self.chk_soak, 9, 0, 1, 4)
+        g2.addWidget(self.chk_soak, 10, 0, 1, 4)
 
-        # 行9-11：Soak 参数区 —— 独立容器，随「稳定性测试」勾选显示/隐藏（方案B）
+        # 行11：Soak 参数区 —— 独立容器，随「稳定性测试」勾选显示/隐藏（方案B）
         self.soak_params = QWidget()
         gs = QGridLayout(self.soak_params)
         gs.setContentsMargins(0, 0, 0, 0)
@@ -931,7 +970,7 @@ class MainWindow(QWidget):
         self.spin_soak_gap.setToolTip("每轮之间的停顿秒数")
         gs.addWidget(self.spin_soak_gap, 11, 3)
 
-        g2.addWidget(self.soak_params, 10, 0, 1, 4)
+        g2.addWidget(self.soak_params, 11, 0, 1, 4)
         # 勾选切换时展开/收起参数区；并同步时长/轮数的启用状态
         self.chk_soak.toggled.connect(self._sync_soak_visibility)
         self._sync_soak_visibility()
@@ -1574,15 +1613,44 @@ class MainWindow(QWidget):
                 _base if rel else
                 _base + "\n【当前「用例类型」未勾选 destroy → 此项不生效】\n"
                         "该参数仅作用于 destroy 用例；若要测破坏场景，请勾选 destroy")
-        """返回选中的用例类型列表"""
-        sel = []
-        if self.chk_type_normal.isChecked():
-            sel.append("normal")
-        if self.chk_type_error.isChecked():
-            sel.append("error")
-        if self.chk_type_destroy.isChecked():
-            sel.append("destroy")
-        return sel
+
+    def _end_by_time(self):
+        """当前是否「按时间」结束"""
+        return (self.combo_end_mode.currentData() or "count") == "time"
+
+    def _sync_end_mode(self):
+        """按「结束条件」启用/置灰 条数与秒数输入框。
+
+        与 Soak 的联动统一收口到 _sync_max_enabled()，避免两处 setEnabled 互相覆盖。
+        """
+        by_time = self._end_by_time()
+        if hasattr(self, "spin_seconds"):
+            self.spin_seconds.setEnabled(by_time)
+            if hasattr(self, "lbl_seconds"):
+                self.lbl_seconds.setEnabled(by_time)
+        self._sync_max_enabled()
+
+    def _sync_max_enabled(self):
+        """「最多条数」可用性 = 结束条件为按条数 且 未勾选 Soak。
+
+        两处联动（结束条件 / Soak 勾选）都走这里，保证状态一致。
+        """
+        if not hasattr(self, "spin_max"):
+            return
+        soak_on = hasattr(self, "chk_soak") and self.chk_soak.isChecked()
+        by_time = self._end_by_time()
+        ok = (not by_time) and (not soak_on)
+        self.spin_max.setEnabled(ok)
+        if hasattr(self, "lbl_max"):
+            self.lbl_max.setEnabled(ok)
+        self.spin_max.setToolTip(
+            "总条数上限（0=全部）。注意：并行进程数>1 时，此值为全部进程合计条数，"
+            "会按进程均分；不会每个进程都发满 N 次"
+            + ("\n【结束条件=按时间 → 此项不生效】\n"
+               "改由「运行秒数」决定发送时长" if by_time else "")
+            + ("\n【当前已勾选「稳定性测试(Soak)」→ 此项不生效】\n"
+               "每轮条数改由下方「Soak每轮条数」决定（soak 会用它覆盖 --max）"
+               if soak_on else ""))
 
     def build_send_cmd(self, name):
         """构造 send_test.py 的命令行"""
@@ -1591,6 +1659,11 @@ class MainWindow(QWidget):
                  "--procs", str(self.spin_procs.value()),
                  "--max", str(self.spin_max.value()),
                  "--wait", str(self.spin_wait.value())]
+        # 结束条件二选一：按时间时传 --seconds（send_test 端持续发到点为止）
+        if self._end_by_time():
+            parts += ["--seconds", str(self.spin_seconds.value())]
+        if self.chk_persec_csv.isChecked():
+            parts.append("--per-sec-csv")
         types = self.selected_types()
         if types and len(types) < 3:
             parts.append("--type")
@@ -1627,6 +1700,44 @@ class MainWindow(QWidget):
         """当前是否"按轮数"模式"""
         return (self.combo_soak_mode.currentData() or "hours") == "rounds"
 
+    def _end_by_time(self):
+        """当前是否「按时间」结束"""
+        return (self.combo_end_mode.currentData() or "count") == "time"
+
+    def _sync_end_mode(self):
+        """按「结束条件」启用/置灰 条数与秒数输入框。
+
+        与 Soak 的联动统一收口到 _sync_max_enabled()，避免两处 setEnabled 互相覆盖。
+        """
+        by_time = self._end_by_time()
+        if hasattr(self, "spin_seconds"):
+            self.spin_seconds.setEnabled(by_time)
+            if hasattr(self, "lbl_seconds"):
+                self.lbl_seconds.setEnabled(by_time)
+        self._sync_max_enabled()
+
+    def _sync_max_enabled(self):
+        """「最多条数」可用性 = 结束条件为按条数 且 未勾选 Soak。
+
+        两处联动（结束条件 / Soak 勾选）都走这里，保证状态一致。
+        """
+        if not hasattr(self, "spin_max"):
+            return
+        soak_on = hasattr(self, "chk_soak") and self.chk_soak.isChecked()
+        by_time = self._end_by_time()
+        ok = (not by_time) and (not soak_on)
+        self.spin_max.setEnabled(ok)
+        if hasattr(self, "lbl_max"):
+            self.lbl_max.setEnabled(ok)
+        self.spin_max.setToolTip(
+            "总条数上限（0=全部）。注意：并行进程数>1 时，此值为全部进程合计条数，"
+            "会按进程均分；不会每个进程都发满 N 次"
+            + ("\n【结束条件=按时间 → 此项不生效】\n"
+               "改由「运行秒数」决定发送时长" if by_time else "")
+            + ("\n【当前已勾选「稳定性测试(Soak)」→ 此项不生效】\n"
+               "每轮条数改由下方「Soak每轮条数」决定（soak 会用它覆盖 --max）"
+               if soak_on else ""))
+
     def _sync_soak_visibility(self):
         """勾选「稳定性测试」才显示 Soak 参数区（方案B：未勾选时界面清爽）
 
@@ -1635,16 +1746,7 @@ class MainWindow(QWidget):
         """
         soak_on = self.chk_soak.isChecked()
         self.soak_params.setVisible(soak_on)
-        if hasattr(self, "spin_max"):
-            self.spin_max.setEnabled(not soak_on)
-            if hasattr(self, "lbl_max"):    # 标签一并灰化，避免"灰框配黑字"的割裂感
-                self.lbl_max.setEnabled(not soak_on)
-            self.spin_max.setToolTip(
-                "总条数上限（0=全部）。注意：并行进程数>1 时，此值为全部进程合计条数，"
-                "会按进程均分；不会每个进程都发满 N 次"
-                + ("\n【当前已勾选「稳定性测试(Soak)」→ 此项不生效】\n"
-                   "每轮条数改由下方「Soak每轮条数」决定（soak 会用它覆盖 --max）"
-                   if soak_on else ""))
+        self._sync_max_enabled()     # 与「结束条件」联动统一收口
         self._sync_soak_button()
 
     def _sync_soak_button(self, running=None):
@@ -1725,6 +1827,9 @@ class MainWindow(QWidget):
             "mock": "1" if self.chk_mock.isChecked() else "0",
             "quiet": "1" if self.chk_quiet.isChecked() else "0",
             "cases": self.edit_cases.text().strip(),
+            "end_mode": self.combo_end_mode.currentData() or "count",
+            "seconds": str(self.spin_seconds.value()),
+            "persec_csv": "1" if self.chk_persec_csv.isChecked() else "0",
             "date_scope": self.combo_date_scope.currentData() or "",
             "accounts": self.edit_accounts.text().strip(),
             "ref_spec": self.edit_ref.text().strip(),
@@ -1945,7 +2050,9 @@ class MainWindow(QWidget):
                 "patterns": [f"{name}_*_stats.json",
                              # create 返回的账号→真实Ref 映射：set/modify/remove 生成时
                              # 要用它回填 __REF token，属关键产物，故始终下载
-                             f"{name}_*_refs.json"],
+                             f"{name}_*_refs.json",
+                             # 按秒明细（--per-sec-csv 产出）：画速率曲线用，勾选时才下
+                             *([f"{name}_*_persec.csv"] if self.chk_persec_csv.isChecked() else [])],
             },
         ]
         if self.chk_download.isChecked():

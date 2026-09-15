@@ -373,6 +373,44 @@ class PerfStats:
                              f"{rec['cpu']:.1f} | {rec['xlen_delta']} | {avg:.1f} | {xavg:.1f}")
         return "\n".join(lines)
 
+    def save_persec_csv(self, path):
+        """导出按秒明细为 CSV（供画速率曲线/脚本分析）。
+
+        列：秒, 时间, 请求数, 字节数(B), 失败数, CPU%, Redis流增量,
+            SendMQ平均(µs), XADD平均(µs)
+        相对时间(0,1,2...)便于直接作图，绝对时间保留用于对账。
+        """
+        import csv
+        s = self.summary()
+        with self.lock:
+            secs = sorted(self.per_sec.keys())
+            rows = []
+            t0 = secs[0] if secs else 0
+            for sec in secs:
+                rec = self.per_sec[sec]
+                avg = (rec["send_us_sum"] / rec["send_us_n"]) if rec.get("send_us_n") else 0
+                xavg = (rec["xadd_us_sum"] / rec["xadd_us_n"]) if rec.get("xadd_us_n") else 0
+                rows.append([
+                    sec - t0,                                   # 相对秒（作图用）
+                    time.strftime("%H:%M:%S", time.localtime(sec)),
+                    rec["req"], rec["bytes"], rec["fail"],
+                    round(rec["cpu"], 1), rec["xlen_delta"],
+                    round(avg, 1), round(xavg, 1),
+                ])
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["相对秒", "时间", "请求数", "字节数(B)", "失败数", "CPU%",
+                        "Redis流增量", "SendMQ平均(µs)", "XADD平均(µs)"])
+            w.writerows(rows)
+            # 末行附平均吞吐，便于快速判读
+            w.writerow([])
+            w.writerow(["汇总", "",
+                        s.get("总请求数"), s.get("请求总字节(B)"), s.get("失败数"),
+                        s.get("CPU平均%"), s.get("Redis写入增量"),
+                        s.get("SendMQ平均(µs)"), s.get("XADD均(µs)")])
+        return path
+
     def save_log(self, path):
         s = self.summary()
         lines = [

@@ -958,6 +958,14 @@ def main():
     ap.add_argument("--accounts", default="",
                     help="只发指定账号的用例（匹配 Excel「云单账号」列，逗号分隔）："
                          "如 010100011301,010100011304。空=全部")
+    ap.add_argument("--seconds", type=float, default=0.0,
+                    help="按时间跑：持续发送 N 秒后停止（0=不限，按 --max 条数跑）。"
+                         "适合测持续写入能力/观察速率是否随时间劣化；"
+                         "常与 --max 配合做上限保护，用例发完会自动循环续发")
+    ap.add_argument("--per-sec-csv", action="store_true",
+                    help="额外导出按秒明细 CSV（<接口>_<ts>_persec.csv）："
+                         "每秒请求数/字节/失败/CPU/Redis流增量/平均延迟。"
+                         "可直接画速率曲线，定位掉速发生在第几秒")
     ap.add_argument("--wait", type=float, default=3.0, help="发完后等待回复秒数")
     ap.add_argument("--reply", type=int, default=0, choices=[0, 1], help="reply_flag")
     ap.add_argument("--init-wait", type=float, default=5.0, help="等待插件 inited 最大秒数(兜底超时，正常2-3s即探测到)")
@@ -1225,13 +1233,79 @@ def main():
                 return ret
 
             t0 = time.time()
-            with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                futs = [ex.submit(do_send, p, f"{c['_no']}_{i}")
-                        for i, (c, p) in enumerate(plugin_cases)]
-                ok = sum(1 for f in futs if f.result() >= 0)
+            ok = 0
+            sent = 0
+            if args.seconds > 0:
+                # ---- 按时间跑：持续投递到点为止，用例发完自动循环续发 ----
+                # 目的：测持续写入能力，并从按秒明细看出速率随时间的变化。
+                # 要点：投递循环必须【不阻塞】—— 之前用 f.result() 同步收割，
+                #       等待期间时间在流逝却不再判断截止，导致 10s 实际跑成 34s。
+                #       这里改为：始终维持 workers 个在飞请求，用 done/exceptions
+                #       非阻塞收割已完成的结果，主循环只做"到点退出"。
+                t_end = t0 + args.seconds
+                nw = max(1, int(args.workers))
+                print(f"\n[INFO] 按时间发送 {args.seconds}s（{nw} 并发；到点即停并收尾在飞请求）...")
+                from concurrent.futures import wait as _fwait, FIRST_COMPLETED
+                with ThreadPoolExecutor(max_workers=nw) as ex:
+                    inflight = set()
+                    idx = 0
+                    submitted = 0
+
+                    def _submit_one():
+                        nonlocal idx, submitted
+                        c, p = plugin_cases[idx % len(plugin_cases)]
+                        inflight.add(ex.submit(do_send, p, f"{c['_no']}_{idx}"))
+                        idx += 1
+                        submitted += 1
+
+                    # 先灌满并发
+                    while len(inflight) < nw and time.time() < t_end:
+                        _submit_one()
+                    while time.time() < t_end:
+                        # 非阻塞收割：只取已完成的，不等待
+                        done = {f for f in inflight if f.done()}
+                        if not done:
+                            # 没有已完成的就短暂让出（仍受 t_end 约束）
+                            done, _ = _fwait(inflight, timeout=0.01,
+                                             return_when=FIRST_COMPLETED)
+                        for f in done:
+                            inflight.discard(f)
+                            sent += 1
+                            try:
+                                if f.result() >= 0:
+                                    ok += 1
+                            except Exception:
+                                pass
+                        # 补齐并发度（到点前才补）
+                        while len(inflight) < nw and time.time() < t_end:
+                            _submit_one()
+                    send_end_ts = time.time()
+                    # 收尾：等已投递的请求完成（不再新投）
+                    n_fin = len(inflight)
+                    if n_fin:
+                        print(f"[INFO] 到点，收尾在飞请求 {n_fin} 条...")
+                    for f in inflight:
+                        sent += 1
+                        try:
+                            if f.result() >= 0:
+                                ok += 1
+                        except Exception:
+                            pass
+                    print(f"[INFO] 发送阶段实际用时 {send_end_ts - t0:.3f}s")
+            else:
+                with ThreadPoolExecutor(max_workers=args.workers) as ex:
+                    futs = [ex.submit(do_send, p, f"{c['_no']}_{i}")
+                            for i, (c, p) in enumerate(plugin_cases)]
+                    ok = sum(1 for f in futs if f.result() >= 0)
+                    sent = len(plugin_cases)
             dt = time.time() - t0
-            print(f"\n[RESULT] 插件发送成功 {ok}/{len(plugin_cases)}，耗时 {dt:.3f}s，"
-                  f"平均 {len(plugin_cases) / dt:.0f} 条/s")
+            if args.seconds > 0:
+                print(f"\n[RESULT] 共投递 {sent} 条，成功 {ok} 条，"
+                      f"目标 {args.seconds}s / 总耗时 {dt:.3f}s，"
+                      f"平均 {sent / max(dt, 1e-6):.0f} 条/s")
+            else:
+                print(f"\n[RESULT] 插件发送成功 {ok}/{len(plugin_cases)}，耗时 {dt:.3f}s，"
+                      f"平均 {len(plugin_cases) / dt:.0f} 条/s")
 
         # 2) 破坏测试：直写 Redis（type1~type4 四类）
         if destroy_cases:
@@ -1343,6 +1417,14 @@ def main():
                     with open(run_log, "a", encoding="utf-8") as f:
                         f.write(stats.detail_text())
                         f.write("\n")
+                # 按秒明细导出 CSV（供画速率曲线/脚本分析）
+                if args.per_sec_csv:
+                    try:
+                        csv_path = os.path.join(out_dir, f"{mod.NAME}_{ts}_persec.csv")
+                        stats.save_persec_csv(csv_path)
+                        print(f"[STATS] 按秒明细 CSV 已保存: {csv_path}")
+                    except Exception as e:
+                        print(f"[WARN] 按秒 CSV 导出失败: {e}")
             except Exception as e:
                 print(f"[WARN] 统计输出失败: {e}")
                 import traceback
