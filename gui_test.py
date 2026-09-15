@@ -1909,7 +1909,10 @@ class MainWindow(QWidget):
             {   # 汇总数据源：始终下载（小文件）
                 "remote": rd + "/performance",
                 "local": local_perf,
-                "patterns": [f"{name}_*_stats.json"],
+                "patterns": [f"{name}_*_stats.json",
+                             # create 返回的账号→真实Ref 映射：set/modify/remove 生成时
+                             # 要用它回填 __REF token，属关键产物，故始终下载
+                             f"{name}_*_refs.json"],
             },
         ]
         if self.chk_download.isChecked():
