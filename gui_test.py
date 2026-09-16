@@ -970,11 +970,25 @@ class MainWindow(QWidget):
         self.spin_soak_gap.setToolTip("每轮之间的停顿秒数")
         gs.addWidget(self.spin_soak_gap, 11, 3)
 
+        # 行12：后台运行（nohup/setsid）—— 启动后立即返回，断开 SSH 也不停
+        self.chk_soak_nohup = QCheckBox("后台运行(nohup)：启动后立即返回，断开/关闭 GUI 也不停")
+        self.chk_soak_nohup.setChecked(self.cfg.get("soak_nohup", "0") == "1")
+        self.chk_soak_nohup.setToolTip(
+            "把 soak 放到远程后台执行（setsid + nohup）后立即返回，不占用 SSH 连接：\n"
+            "· 适合跑通宵/长时间稳定性测试——关掉 GUI 或断网都不影响远程继续跑\n"
+            "· 启动后日志写入远程 out/soak/soak_<接口>_<时间>_nohup.log（终端输出）\n"
+            "  以及 soak_<接口>_<时间>_soak.log（编排日志，用 tail -f 看进度）\n"
+            "· 结果不会自动下载：跑完后点「下载结果」或手动 scp\n"
+            "· 停止：在远程执行 pkill -INT -f soak_test.py（别用 -9，会丢 summary.json）")
+        gs.addWidget(self.chk_soak_nohup, 12, 0, 1, 4)
+        self.chk_soak_nohup.toggled.connect(self._sync_soak_nohup)
+
         g2.addWidget(self.soak_params, 11, 0, 1, 4)
         # 勾选切换时展开/收起参数区；并同步时长/轮数的启用状态
         self.chk_soak.toggled.connect(self._sync_soak_visibility)
         self._sync_soak_visibility()
         self._sync_soak_mode()
+        self._sync_soak_nohup()
 
         left_lay.addWidget(grp2)
 
@@ -1700,6 +1714,24 @@ class MainWindow(QWidget):
         """当前是否"按轮数"模式"""
         return (self.combo_soak_mode.currentData() or "hours") == "rounds"
 
+    def _soak_nohup(self):
+        """当前是否后台运行（nohup）模式"""
+        return hasattr(self, "chk_soak_nohup") and self.chk_soak_nohup.isChecked()
+
+    def _sync_soak_nohup(self):
+        """后台模式下提示：结果不自动下载（需要的话跑完再点下载/手动 scp）"""
+        if not hasattr(self, "chk_soak_nohup"):
+            return
+        on = self.chk_soak_nohup.isChecked()
+        _base = ("把 soak 放到远程后台执行（setsid + nohup）后立即返回，不占用 SSH 连接：\n"
+                 "· 适合跑通宵/长时间稳定性测试——关掉 GUI 或断网都不影响远程继续跑\n"
+                 "· 启动后日志写入远程 out/soak/soak_<接口>_<时间>_nohup.log（终端输出）\n"
+                 "  以及 soak_<接口>_<时间>_soak.log（编排日志，用 tail -f 看进度）\n"
+                 "· 结果不会自动下载：跑完后点「下载结果」或手动 scp\n"
+                 "· 停止：在远程执行 pkill -INT -f soak_test.py（别用 -9，会丢 summary.json）")
+        self.chk_soak_nohup.setToolTip(
+            _base if on else _base + "\n【当前未勾选】前台运行：GUI 会一直连着 SSH 等它跑完")
+
     def _end_by_time(self):
         """当前是否「按时间」结束"""
         return (self.combo_end_mode.currentData() or "count") == "time"
@@ -1769,7 +1801,13 @@ class MainWindow(QWidget):
         self.spin_soak_rounds.setEnabled(by_rounds)
 
     def build_soak_cmd(self, name):
-        """构造 soak_test.py 命令行（send_test 的发送参数作为透传传给它）"""
+        """构造 soak_test.py 命令行。
+
+        勾选「后台运行(nohup)」时包成 setsid+nohup 形式：
+          - 立即返回、不等它跑完（SshWorker 靠 exit_status_ready 判定结束，
+            实测 0.2s 内通道释放，后台进程存活）
+          - 输出重定向到 out/soak/soak_<接口>_<时间>_nohup.log
+        """
         parts = ["python3", "soak_test.py",
                  "--interface", name]
         # 结束条件二选一：--rounds 优先于 --hours（soak 端两者同时给也以 rounds 为准）
@@ -1797,7 +1835,17 @@ class MainWindow(QWidget):
             parts.append("--no-mock")
         if self.chk_quiet.isChecked():
             parts.append("--quiet")
-        return " ".join(parts)
+        cmd = " ".join(parts)
+        if self._soak_nohup():
+            # 后台运行：setsid 脱离会话 + nohup 忽略 HUP + 断开三个 fd，
+            # 让 SSH 通道能立刻结束（实测 0.2s 释放，后台进程不受影响）。
+            # 日志走 out/soak/*_nohup.log；soak 自己还会写 *_soak.log（编排日志）。
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            logf = f"out/soak/soak_{name}_{ts}_nohup.log"
+            cmd = (f"mkdir -p out/soak && "
+                   f"setsid nohup {cmd} > {logf} 2>&1 < /dev/null & disown; "
+                   f"echo \"[NOHUP] 已后台启动，日志: {logf}\"")
+        return cmd
 
     def _pick_ref_map_file(self):
         """浏览选择 create 返回 Ref 的回填 JSON。"""
@@ -1846,6 +1894,7 @@ class MainWindow(QWidget):
             "soak_gap": str(self.spin_soak_gap.value()),
             "soak_clean": self.combo_soak_clean.currentData() or "monitor",
             "soak_rotate": "1" if self.chk_soak_rotate.isChecked() else "0",
+            "soak_nohup": "1" if self.chk_soak_nohup.isChecked() else "0",
             "remote": "1" if self.chk_remote.isChecked() else "0",
             "download": "1" if self.chk_download.isChecked() else "0",
             "auto_export": "1" if self.chk_auto_export.isChecked() else "0",
@@ -2015,6 +2064,7 @@ class MainWindow(QWidget):
             "Soak轮间隔(秒)": str(self.spin_soak_gap.value()),
             "Soak流处理": self.combo_soak_clean.currentData(),
             "Soak轮换用例": "开" if self.chk_soak_rotate.isChecked() else "关",
+            "Soak后台运行": "开" if self._soak_nohup() else "关",
             "并发线程数(workers)": str(self.spin_workers.value()),
             "等待回复秒数(wait)": str(self.spin_wait.value()),
             "远程执行": "开" if self.chk_remote.isChecked() else "关",
@@ -2027,6 +2077,17 @@ class MainWindow(QWidget):
                         f"{'轮数 ' + str(self.spin_soak_rounds.value()) + ' 轮' if self._soak_by_rounds() else '时长 ' + str(self.spin_soak_hours.value()) + 'h'}，"
                         f"每轮 {self.spin_soak_batch.value()} 条，"
                         f"流处理 {self.combo_soak_clean.currentData()}")
+        if self._soak_nohup():
+            _rd = self.edit_remote_dir.text().strip()
+            _host = self.edit_host.text().strip()
+            _user = self.edit_user.text().strip()
+            self.append_log(
+                "[SOAK] 后台运行模式：命令已提交到远程，GUI 不会等待其跑完。\n"
+                f"       看进度: tail -f {_rd}/out/soak/soak_*_soak.log\n"
+                f"       停止:   pkill -INT -f soak_test.py（别用 -9，会丢 summary.json）\n"
+                "       结果文件不会自动下载；跑完后手动取回（在 Windows 上执行）:\n"
+                f"         scp {_user}@{_host}:{_rd}/out/soak/soak_*_trend.csv .\n"
+                f"         scp {_user}@{_host}:{_rd}/out/soak/soak_*_summary.json .")
         self._run_next_batch_item()
 
     def _download_config_for(self, name):
@@ -2104,7 +2165,9 @@ class MainWindow(QWidget):
                 self.edit_user.text().strip(), self.edit_pass.text(),
                 self.edit_remote_dir.text().strip(), cmd_str,
                 files_to_upload=self.remote_upload_files(name),
-                download_config=dl, parent=self)
+                # 后台模式：命令刚返回，结果还没产出，下载没有意义（且会白跑一趟）
+                download_config=(None if (use_soak and self._soak_nohup()) else dl),
+                parent=self)
             self.worker.line.connect(self.append_log)
             self.worker.finished.connect(lambda rc: self.on_batch_item_done(rc))
             self.worker.start()
