@@ -194,7 +194,7 @@ def load_interface(name):
     return mod
 
 
-def load_cases(excel, max_cases, want_types=None, date_scope=""):
+def load_cases(excel, max_cases, want_types=None, date_scope="", stop_after_rows=0):
     """读取 Excel 用例，并按 want_types / date_scope 过滤后返回。
 
     max_cases > 0 时提前终止：读够这么多"已过滤"用例就停，不再解析后续行。
@@ -208,9 +208,14 @@ def load_cases(excel, max_cases, want_types=None, date_scope=""):
                 过滤（在 __TODAY__ 展开成具体日期之前按原始值判断）。
                 today=按日查询（查 Redis）；month/year=查数据库。
                 参与过滤与提前终止计数。
+    stop_after_rows: 读到第 N 个有效数据行就停（按【原始行号】计数，不做任何过滤）。
+                     供 --cases 用纯数字行号区间时提前终止——例如 "--cases 10001-10100"
+                     只需读到第 10100 行，不必解析整表。
+                     注意：此模式必须与 want_types/date_scope 互斥（传空），
+                     否则先过滤会让行号错位、--cases 指的不是原来的行。
 
-    注意：调用方若要用 --cases 按"Excel 原始行号"筛选，必须传 max_cases=0
-    （提前终止会打乱行号与数据的对应关系）。
+    注意：调用方若要用 --cases 按"用例编号"（字母前缀）筛选，必须传
+    stop_after_rows=0（编号可能出现在表的任意位置，无法预知读到哪停）。
     """
     _SCOPE = {
         "today": ("__TODAY__", "__TODAY__"),
@@ -248,13 +253,22 @@ def load_cases(excel, max_cases, want_types=None, date_scope=""):
         headers = [_key(h) for h in header_row]
         ncol = len(headers)
         cases = []
+        n_rows = 0          # 已读到的【原始数据行号】（1 起始，与 --cases 纯数字对齐）
         for raw in it:
             if raw is None or all(v is None or str(v).strip() == "" for v in raw):
                 continue
+            n_rows += 1
             rec = {headers[i]: ("" if raw[i] is None else raw[i])
                    for i in range(min(ncol, len(raw)))}
             rec["_no"] = rec.get("case_no") or f"C{len(cases) + 1}"
             rec["_type"] = (rec.get("case_type") or "normal").strip().lower()
+            # stop_after_rows：按原始行号提前终止（不做过滤，保证行号不错位）。
+            # 先把当前行收进来再判断，确保第 N 行本身不丢。
+            if stop_after_rows:
+                cases.append(rec)
+                if n_rows >= stop_after_rows:
+                    break
+                continue
             # 过滤在读取阶段完成：既保证返回的就是最终结果，也让提前终止的
             # 计数天然等于"已过滤条数"（不必再让调用方重复过滤一遍）
             if not _hits(rec):
@@ -269,23 +283,27 @@ def load_cases(excel, max_cases, want_types=None, date_scope=""):
 
 
 def parse_case_spec(spec):
-    """解析用例编号筛选表达式，如 'C1,C3-C10,25-30'。逗号/空白分隔，可混用。
-    返回 (singles, ranges)：
+    """解析用例编号筛选表达式，如 'C1,C3-C10,25-30' 或 'QG0001,QG3-QG10'。
+    逗号/空白分隔，可混用。返回 (singles, ranges)：
       singles: {(前缀大写或'', 数字), ...}   前缀 '' 表示按 Excel 数据行号（1 起始）
       ranges:  [(前缀大写或'', 起始, 结束), ...]
+
+    前缀支持【多个字母】（如 query 表的 QG0001、create 表的 CG0001）。
+    此前正则只允许单个字母，导致 --cases QG0001 报「无法识别的用例编号」。
     """
     singles, ranges = set(), []
     for tok in re.split(r"[,，;\s]+", spec.strip()):
         if not tok:
             continue
-        m = re.fullmatch(r"([A-Za-z]?)(\d+)(?:-([A-Za-z]?)(\d+))?", tok)
+        m = re.fullmatch(r"([A-Za-z]*)(\d+)(?:-([A-Za-z]*)(\d+))?", tok)
         if not m:
-            raise ValueError(f"无法识别的用例编号: {tok}（示例: C1 / C3-C10 / 5-20）")
-        p1, n1 = m.group(1).upper(), int(m.group(2))
-        if m.group(3) is None:
+            raise ValueError(f"无法识别的用例编号: {tok}（示例: C1 / QG0001 / C3-C10 / 5-20）")
+        p1, n1 = (m.group(1) or "").upper(), int(m.group(2))
+        if m.group(3) is None and m.group(4) is None:
             singles.add((p1, n1))
         else:
-            p2 = (m.group(3) or p1).upper()   # 右端省略前缀时沿用左端（如 C3-10）
+            # 右端省略前缀时沿用左端（如 C3-10、QG3-10）
+            p2 = (m.group(3) or p1).upper()
             if p1 != p2:
                 raise ValueError(f"范围前后编号前缀不一致: {tok}")
             a, b = sorted((n1, int(m.group(4))))
@@ -295,12 +313,13 @@ def parse_case_spec(spec):
 
 def filter_cases_by_spec(cases, spec):
     """按用例编号/行号筛选用例。
-    C 编号（如 C1/C005）匹配 Excel「用例编号」列，忽略大小写与前导零；
+    带字母前缀的（如 C1 / QG0001）匹配 Excel「用例编号」列，忽略大小写与前导零；
     纯数字（如 5）按 Excel 数据行号匹配（1 起始）。返回筛选后的列表。"""
     singles, ranges = parse_case_spec(spec)
 
     def _no_key(c):
-        m = re.match(r"([A-Za-z]?)0*(\d+)$", str(c["_no"]).strip())
+        # 前缀支持多字母（QG0001 / CG0001 等）
+        m = re.match(r"([A-Za-z]*)0*(\d+)$", str(c["_no"]).strip())
         return (m.group(1).upper(), int(m.group(2))) if m else None
 
     picked = []
@@ -315,6 +334,31 @@ def filter_cases_by_spec(cases, spec):
         if hit:
             picked.append(c)
     return picked
+
+
+def row_stop_of_spec(spec):
+    """若 --cases 只含【纯数字行号】条件，返回需要读到的最大行号（用于提前终止）；
+    否则返回 0（含字母前缀编号时必须读全表——编号可能在任意位置）。
+
+    例：'10001-10100'      -> 10100   （只读到第 10100 行即可）
+        '100,200-300'      -> 300
+        '5'                -> 5
+        'C1' / 'QG0001'    -> 0       （按编号匹配，无法预知位置）
+        '10001-10100,QG1'  -> 0       （混了编号，退化为全读）
+    """
+    try:
+        singles, ranges = parse_case_spec(spec)
+    except ValueError:
+        return 0
+    # 有任何带字母前缀的条件 → 必须全读
+    if any(p for p, _ in singles) or any(p for p, _, _ in ranges):
+        return 0
+    hi = 0
+    for _, n in singles:
+        hi = max(hi, n)
+    for _, _, b in ranges:
+        hi = max(hi, b)
+    return hi
 
 
 # ==================== 插件客户端 ====================
@@ -1033,7 +1077,7 @@ def main():
     excel = args.excel or os.path.join(DATA_DIR, f"{mod.NAME}.xlsx")
     # 读取期过滤+提前终止的启用条件：无 --cases。
     # --cases 按"Excel 原始行号/编号"筛选，读取期先过滤会让行号与原始顺序错位，
-    # 故该场景必须全量读取（_pass_types/_pass_scope 传空），过滤留给下游。
+    # 故该场景不做读取期过滤（_pass_types/_pass_scope 传空），过滤留给下游。
     _by_cases = bool(args.cases.strip())
     _pass_types = None
     if args.type and not _by_cases:
@@ -1041,9 +1085,13 @@ def main():
     _pass_scope = "" if _by_cases else args.date_scope
     # --max>0 才提前终止；0=全部，本就要读完整表
     _max_cases = args.max if (args.max > 0 and not _by_cases) else 0
+    # --cases 为纯数字行号区间时（如 soak 轮换的 "10001-10100"），可只读到区间上界。
+    # 这种形式不做读取期过滤，行号语义不变，故能安全提前终止。
+    # 带字母前缀的编号（C1/QG0001）无法预知位置 → row_stop_of_spec 返回 0 → 全读。
+    _row_stop = row_stop_of_spec(args.cases) if _by_cases else 0
     _t_read = time.time()
     cases = load_cases(excel, _max_cases, want_types=_pass_types,
-                       date_scope=_pass_scope)
+                       date_scope=_pass_scope, stop_after_rows=_row_stop)
     _read_dt = time.time() - _t_read
     # 空数据必须在这里拦掉：否则下面 --max 循环扩量时 base 为空会陷入死循环
     if not cases:

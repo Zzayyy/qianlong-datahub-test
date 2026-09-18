@@ -835,14 +835,19 @@ class MainWindow(QWidget):
         # 行6：用例编号筛选（--cases），定位中台挂掉时逐条/分段发送
         g2.addWidget(QLabel("用例编号:"), 6, 0)
         self.edit_cases = QLineEdit(self.cfg.get("cases", ""))
-        self.edit_cases.setPlaceholderText("如 C1,C3-C10 或 5-20（空=全部）")
+        self.edit_cases.setPlaceholderText("如 QG0001,QG5-QG10 或 100-200（空=全部）")
         self.edit_cases.setToolTip(
-            "只发送指定用例，用于逐条排查中台崩溃：\n"
-            "· C 编号按 Excel「用例编号」列匹配（忽略大小写/前导零），如 C1、C005、C3-C10\n"
-            "· 纯数字按 Excel 数据行号匹配（1 起始），如 5、5-20\n"
-            "· 逗号分隔可混用：C1,C3-C10,25\n"
+            "只发送指定用例：\n"
+            "· 带字母前缀按 Excel「用例编号」列匹配（忽略大小写/前导零），"
+            "前缀支持多个字母：C1、QG0001、CG3-CG10\n"
+            "· 纯数字按 Excel 数据行号匹配（1 起始）：5、5-20、10001-10100\n"
+            "· 逗号分隔可混用：QG1,QG5-QG10,25\n"
             "· 与「用例类型」叠加过滤；留空发全部\n"
-            "查看发送的报文：关掉安静模式可逐条打印；--no-send 预览可存 out/{接口}_requests.jsonl")
+            "\n性能：纯数字行号会【读到该区间上界即停】，不必解析整表"
+            "（如 1-100 实测快 80 倍）；\n"
+            "带字母的编号位置不可预知，仍需全读。\n"
+            "\n查看发送的报文：关掉安静模式可逐条打印；"
+            "--no-send 预览可存 out/{接口}_requests.jsonl")
         g2.addWidget(self.edit_cases, 6, 1, 1, 3)
 
         # 行7：预览模式（--no-send，只生成报文不发送）
@@ -962,7 +967,20 @@ class MainWindow(QWidget):
         gs.addWidget(self.combo_soak_clean, 11, 1)
         self.chk_soak_rotate = QCheckBox("轮换用例")
         self.chk_soak_rotate.setChecked(self.cfg.get("soak_rotate", "1") == "1")
-        self.chk_soak_rotate.setToolTip("每轮按行号轮换用例（末尾回绕），避免重复发同一批数据")
+        self.chk_soak_rotate.setToolTip(
+            "每轮按行号轮换用例（末尾回绕），避免重复发同一批数据。\n"
+            "\n"
+            "· create 等有唯一性约束的接口【建议开启】：不开的话每轮都发同一批，"
+            "第 2 轮起会因账号/单号重复而失败\n"
+            "· query 这类只读接口：开不开都能跑，但开启后能覆盖全部用例"
+            "（如 10167 行 → 覆盖 9900 个不同账号），数据也更有代表性\n"
+            "\n"
+            "实现方式：soak 每轮生成 --cases <行号区间>（如 10001-10100）。\n"
+            "纯数字区间会【读到上界即停】，不必解析整表，故轮换本身开销很小。\n"
+            "\n"
+            "注意：轮换区间绕到表尾时，若该段用例与「用例类型」筛选不匹配"
+            "（如尾部全是 error/destroy 而只勾了 normal），该轮会被记为"
+            "『跳过』而非异常，不计入 rounds_abnormal。")
         gs.addWidget(self.chk_soak_rotate, 11, 2)
         self.spin_soak_gap = QDoubleSpinBox()
         self.spin_soak_gap.setRange(0, 3600)
