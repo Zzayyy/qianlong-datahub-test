@@ -306,7 +306,7 @@ def main():
     with open(trend_path, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(header)
 
-    totals = {"rounds": 0, "abnormal": 0, "req": 0, "ok": 0, "fail": 0,
+    totals = {"rounds": 0, "abnormal": 0, "skipped": 0, "req": 0, "ok": 0, "fail": 0,
               "expect": 0, "got": 0}
     abnormal_rounds = []
     round_no = 0
@@ -338,10 +338,21 @@ def main():
             reply_xlen = probe.xlen(reply_stream)
 
             if stats is None:
+                # 「过滤后无用例」是轮换区间与 --type 不匹配的数据问题，不是系统异常：
+                # rotate 绕到 Excel 尾部时该段可能全是 error/destroy，被 --type normal 滤空。
+                # 计入异常会污染趋势判定（0917 那次跑出 87 个此类记录，中台其实全程正常）。
+                if "过滤后无用例" in err or "未匹配到任何用例" in err:
+                    totals["skipped"] += 1
+                    log(f"第 {round_no} 轮跳过（该轮用例不匹配 --type 过滤）: "
+                        f"{err.split('|')[-1].strip()[:80]}")
+                    continue
                 log(f"第 {round_no} 轮失败: {err}（耗时 {dt:.1f}s）")
                 totals["abnormal"] += 1
                 abnormal_rounds.append(round_no)
-                row = [round_no, _now_str()] + [""] * 15 + [req_xlen, reply_xlen, f"ERR:{err}"]
+                # 列数必须与表头一致（19 列）：轮次/时间(2) + 中间指标(14)
+                # + 请求流XLEN/回复流XLEN/异常(3)。此前误写 15，导致异常轮多一列、
+                # 整行列错位（回复流XLEN 显示成 XXXX01、异常列变成 xlen 值）
+                row = [round_no, _now_str()] + [""] * 14 + [req_xlen, reply_xlen, f"ERR:{err}"]
             else:
                 ok_rate = float(stats.get("成功率%") or 0)
                 rr = stats.get("回复率%")
@@ -402,6 +413,7 @@ def main():
             "clean_mode": args.clean,
             "rounds_total": totals["rounds"],
             "rounds_abnormal": totals["abnormal"],
+            "rounds_skipped": totals["skipped"],
             "abnormal_rounds": abnormal_rounds,
             "req_total": totals["req"],
             "ok_total": totals["ok"],

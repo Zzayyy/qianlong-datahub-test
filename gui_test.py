@@ -1820,6 +1820,15 @@ class MainWindow(QWidget):
                   "--clean", self.combo_soak_clean.currentData() or "monitor"]
         if self.chk_soak_rotate.isChecked():
             parts.append("--rotate")
+        # 查询时间窗 / 指定账号：与普通发送一致，一并透传给 soak。
+        # 此前只有 build_send_cmd 传了这两个参数，soak 命令漏传 → GUI 里选「查询时间窗」
+        # 对稳定性测试不生效（soak 会发全部用例）。补上后两处行为一致。
+        _ds = self.combo_date_scope.currentData()
+        if _ds:
+            parts += ["--date-scope", _ds]
+        _acc = self.edit_accounts.text().strip()
+        if _acc:
+            parts += ["--accounts", _acc]
         # 透传给 send_test.py 的发送参数（soak 会原样转发）
         parts += ["--workers", str(self.spin_workers.value()),
                   "--procs", str(self.spin_procs.value()),
