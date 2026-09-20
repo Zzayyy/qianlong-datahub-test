@@ -195,6 +195,59 @@ def _cases_spec(offset, batch, total):
     return ",".join(parts)
 
 
+# ==================== 数值容错 ====================
+# 背景（0919 soak 事故）：stats JSON 里的字段可能是字符串 'N/A'（表示"该项不适用"）。
+# 'N/A' 是【非空字符串 = truthy】，所以 `int(v or 0)` 里 `or 0` 兜不住它，
+# int() 会抛 ValueError。原写法 totals["expect"] += int(stats.get("期望回复数") or 0)
+# 因此就地崩掉整场 soak —— 计划 32h、已跑 21.5h 的任务被一轮脏数据终止。
+def _as_num(v):
+    """把 stats 值安全转成数值；'N/A'/None/''/非法值一律返回 None。"""
+    if isinstance(v, bool):          # bool 是 int 的子类，但不能当性能数值用
+        return None
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _int_or(v, default=0):
+    n = _as_num(v)
+    return int(n) if n is not None else default
+
+
+def _float_or(v, default=0.0):
+    n = _as_num(v)
+    return float(n) if n is not None else default
+
+
+def _acc_round(totals, stats):
+    """把一轮 stats 累加进 totals，返回 (bad, reply_unknown)。
+
+    reply_unknown：期望回复数是 'N/A'，说明该轮没跑到回复结算
+    （多为插件未就绪、一条请求都没发出去）。这本身必须判为异常轮——
+    若静默当成 0，会把"插件没起来"伪装成"正常跑完"，丢掉关键信号。
+
+    注意：本函数不累加 totals["rounds"]（轮次计数由主循环统一负责，
+    确保无论走正常/异常/失败哪条路径都只计一次，不会重复或漏计）。
+    """
+    ok_rate = _float_or(stats.get("成功率%"))
+    reply_rate = _float_or(stats.get("回复率%"))
+    reply_unknown = _as_num(stats.get("期望回复数")) is None
+    bad = reply_unknown or ok_rate < MIN_OK_RATE or reply_rate < MIN_REPLY_RATE
+    totals["req"] += _int_or(stats.get("总请求数"))
+    totals["ok"] += _int_or(stats.get("成功数"))
+    totals["fail"] += _int_or(stats.get("失败数"))
+    totals["expect"] += _int_or(stats.get("期望回复数"))
+    totals["got"] += _int_or(stats.get("收到回复数"))
+    if reply_unknown:
+        totals["reply_unknown"] += 1
+    return bad, reply_unknown
+
+
 # ==================== 单轮执行 ====================
 def run_round(args, round_no, round_dir, cases_spec=None):
     """跑一轮 send_test.py。返回 (stats_dict 或 None, 错误信息)。"""
@@ -307,7 +360,7 @@ def main():
         csv.writer(f).writerow(header)
 
     totals = {"rounds": 0, "abnormal": 0, "skipped": 0, "req": 0, "ok": 0, "fail": 0,
-              "expect": 0, "got": 0}
+              "expect": 0, "got": 0, "reply_unknown": 0}
     abnormal_rounds = []
     round_no = 0
     start_ts = time.time()
@@ -330,63 +383,73 @@ def main():
             if args.rotate and total_rows > 0:
                 cases_spec = _cases_spec((round_no - 1) * args.batch, args.batch, total_rows)
             t0 = time.time()
-            stats, err = run_round(args, round_no, round_dir, cases_spec)
-            dt = time.time() - t0
+            # 单轮全程异常隔离：任何一轮的意外异常只标记该轮为异常并继续，
+            # 绝不允许它终止整场 soak（0919 事故：一轮的 int('N/A') 干掉了跑了 21.5h 的任务）
+            req_xlen = reply_xlen = None
+            try:
+                stats, err = run_round(args, round_no, round_dir, cases_spec)
+                dt = time.time() - t0
 
-            req_xlen = probe.xlen(REQ_STREAM)
-            reply_stream = probe.reply_stream()
-            reply_xlen = probe.xlen(reply_stream)
+                req_xlen = probe.xlen(REQ_STREAM)
+                reply_stream = probe.reply_stream()
+                reply_xlen = probe.xlen(reply_stream)
 
-            if stats is None:
-                # 「过滤后无用例」是轮换区间与 --type 不匹配的数据问题，不是系统异常：
-                # rotate 绕到 Excel 尾部时该段可能全是 error/destroy，被 --type normal 滤空。
-                # 计入异常会污染趋势判定（0917 那次跑出 87 个此类记录，中台其实全程正常）。
-                if "过滤后无用例" in err or "未匹配到任何用例" in err:
-                    totals["skipped"] += 1
-                    log(f"第 {round_no} 轮跳过（该轮用例不匹配 --type 过滤）: "
-                        f"{err.split('|')[-1].strip()[:80]}")
-                    continue
-                log(f"第 {round_no} 轮失败: {err}（耗时 {dt:.1f}s）")
-                totals["abnormal"] += 1
-                abnormal_rounds.append(round_no)
-                # 列数必须与表头一致（19 列）：轮次/时间(2) + 中间指标(14)
-                # + 请求流XLEN/回复流XLEN/异常(3)。此前误写 15，导致异常轮多一列、
-                # 整行列错位（回复流XLEN 显示成 XXXX01、异常列变成 xlen 值）
-                row = [round_no, _now_str()] + [""] * 14 + [req_xlen, reply_xlen, f"ERR:{err}"]
-            else:
-                ok_rate = float(stats.get("成功率%") or 0)
-                rr = stats.get("回复率%")
-                reply_rate = float(rr) if isinstance(rr, (int, float)) else 0.0
-                bad = (ok_rate < MIN_OK_RATE) or (reply_rate < MIN_REPLY_RATE)
-                totals["rounds"] += 1
-                totals["req"] += int(stats.get("总请求数") or 0)
-                totals["ok"] += int(stats.get("成功数") or 0)
-                totals["fail"] += int(stats.get("失败数") or 0)
-                totals["expect"] += int(stats.get("期望回复数") or 0)
-                totals["got"] += int(stats.get("收到回复数") or 0)
-                if bad:
+                if stats is None:
+                    # 「过滤后无用例」是轮换区间与 --type 不匹配的数据问题，不是系统异常：
+                    # rotate 绕到 Excel 尾部时该段可能全是 error/destroy，被 --type normal 滤空。
+                    # 计入异常会污染趋势判定（0917 那次跑出 87 个此类记录，中台其实全程正常）。
+                    if "过滤后无用例" in err or "未匹配到任何用例" in err:
+                        totals["skipped"] += 1
+                        log(f"第 {round_no} 轮跳过（该轮用例不匹配 --type 过滤）: "
+                            f"{err.split('|')[-1].strip()[:80]}")
+                        continue
+                    log(f"第 {round_no} 轮失败: {err}（耗时 {dt:.1f}s）")
+                    totals["rounds"] += 1      # 总轮次=所有非跳过轮（含异常轮），见下
                     totals["abnormal"] += 1
                     abnormal_rounds.append(round_no)
-                row = [round_no, _now_str(),
-                       stats.get("总请求数"), stats.get("成功数"), stats.get("失败数"),
-                       stats.get("成功率%"), stats.get("期望回复数"), stats.get("收到回复数"),
-                       stats.get("缺回复数"), stats.get("回复率%"),
-                       stats.get("发送耗时(s)"), stats.get("等待回复耗时(s)"),
-                       stats.get("SendMQ平均(µs)"), stats.get("SendMQ p99(µs)"),
-                       stats.get("SendMQ max(µs)"), stats.get("CPU平均%"),
-                       req_xlen, reply_xlen, "异常" if bad else ""]
-                log(f"第 {round_no} 轮完成: 请求={stats.get('总请求数')} "
-                    f"成功={stats.get('成功数')} "
-                    f"回复={stats.get('收到回复数')}/{stats.get('期望回复数')} "
-                    f"回复率={stats.get('回复率%')} 耗时={dt:.1f}s"
-                    + ("  [异常]" if bad else ""))
-                # 正常轮清掉明细避免堆积；异常轮保留供排查
-                if not args.keep_round_stats and not bad:
-                    try:
-                        for fn in os.listdir(round_dir):
-                            os.remove(os.path.join(round_dir, fn))
-                    except Exception:
-                        pass
+                    # 列数必须与表头一致（19 列）：轮次/时间(2) + 中间指标(14)
+                    # + 请求流XLEN/回复流XLEN/异常(3)。此前误写 15，导致异常轮多一列、
+                    # 整行列错位（回复流XLEN 显示成 XXXX01、异常列变成 xlen 值）
+                    row = [round_no, _now_str()] + [""] * 14 + [req_xlen, reply_xlen, f"ERR:{err}"]
+                else:
+                    bad, reply_unknown = _acc_round(totals, stats)
+                    totals["rounds"] += 1      # 总轮次=所有非跳过轮（含异常轮）
+                    if bad:
+                        totals["abnormal"] += 1
+                        abnormal_rounds.append(round_no)
+                    # 回复未知(N/A)要显式标出：这不是"跑正常了"，而是没跑到回复结算
+                    flag = ("异常(回复N/A)" if reply_unknown else "异常") if bad else ""
+                    row = [round_no, _now_str(),
+                           stats.get("总请求数"), stats.get("成功数"), stats.get("失败数"),
+                           stats.get("成功率%"), stats.get("期望回复数"), stats.get("收到回复数"),
+                           stats.get("缺回复数"), stats.get("回复率%"),
+                           stats.get("发送耗时(s)"), stats.get("等待回复耗时(s)"),
+                           stats.get("SendMQ平均(µs)"), stats.get("SendMQ p99(µs)"),
+                           stats.get("SendMQ max(µs)"), stats.get("CPU平均%"),
+                           req_xlen, reply_xlen, flag]
+                    log(f"第 {round_no} 轮完成: 请求={stats.get('总请求数')} "
+                        f"成功={stats.get('成功数')} "
+                        f"回复={stats.get('收到回复数')}/{stats.get('期望回复数')} "
+                        f"回复率={stats.get('回复率%')} 耗时={dt:.1f}s"
+                        + ("  [异常]" if bad else "")
+                        + ("  [回复N/A:该轮未跑到回复结算]" if reply_unknown else ""))
+                    # 正常轮清掉明细避免堆积；异常轮保留供排查
+                    if not args.keep_round_stats and not bad:
+                        try:
+                            for fn in os.listdir(round_dir):
+                                os.remove(os.path.join(round_dir, fn))
+                        except Exception:
+                            pass
+            except Exception as e:
+                # 本轮出意外 -> 只记异常轮，继续下一轮（不 re-raise）
+                dt = time.time() - t0
+                totals["rounds"] += 1      # 总轮次=所有非跳过轮（含异常轮）
+                totals["abnormal"] += 1
+                abnormal_rounds.append(round_no)
+                log(f"第 {round_no} 轮异常（已隔离，继续后续轮次）: "
+                    f"{type(e).__name__}: {e}（耗时 {dt:.1f}s）")
+                row = [round_no, _now_str()] + [""] * 14 + \
+                      [req_xlen, reply_xlen, f"EXC:{type(e).__name__}: {e}"]
 
             with open(trend_path, "a", newline="", encoding="utf-8-sig") as f:
                 csv.writer(f).writerow(row)
@@ -414,6 +477,7 @@ def main():
             "rounds_total": totals["rounds"],
             "rounds_abnormal": totals["abnormal"],
             "rounds_skipped": totals["skipped"],
+            "rounds_reply_unknown": totals["reply_unknown"],
             "abnormal_rounds": abnormal_rounds,
             "req_total": totals["req"],
             "ok_total": totals["ok"],
