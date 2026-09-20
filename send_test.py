@@ -194,6 +194,29 @@ def load_interface(name):
     return mod
 
 
+def _read_header_keys(excel):
+    """读 Excel 表头字段名（与 load_cases 的解析口径一致），失败返回 []。
+
+    仅供"过滤后为空"的报错文案展示，让用户一眼看出该接口到底有哪些列
+    （例如 acc_sign 没有 BeginDate/EndDate，套 --date-scope 必然 0 条）。
+    """
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(excel, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            header = next(ws.iter_rows(values_only=True))
+        finally:
+            wb.close()
+        out = []
+        for h in header or []:
+            m = re.search(r"\(([A-Za-z_][A-Za-z0-9_]*)\)", str(h))
+            out.append(m.group(1) if m else str(h).strip())
+        return out
+    except Exception:
+        return []
+
+
 def load_cases(excel, max_cases, want_types=None, date_scope="", stop_after_rows=0):
     """读取 Excel 用例，并按 want_types / date_scope 过滤后返回。
 
@@ -1095,6 +1118,21 @@ def main():
     _read_dt = time.time() - _t_read
     # 空数据必须在这里拦掉：否则下面 --max 循环扩量时 base 为空会陷入死循环
     if not cases:
+        # 区分"文件真的空"与"过滤器把行全滤掉了"——后者文案若只说"没有数据行"，
+        # 会让人以为 Excel 坏了（0920 事故：--date-scope today 套在 acc_sign 上，
+        # 表里没有 BeginDate/EndDate 列 -> 10211 行全滤空，却报"表头之后没有数据行"）
+        _why = []
+        if _pass_types:
+            _why.append(f"--type {','.join(sorted(_pass_types))}")
+        if _pass_scope:
+            _why.append(f"--date-scope {_pass_scope}")
+        if _why:
+            _keys = _read_header_keys(excel)
+            sys.exit(f"[FAIL] {excel} 的用例被 {' + '.join(_why)} 全部过滤掉了"
+                     f"（表里并非没有数据行，是过滤条件不匹配）。\n"
+                     f"       该接口表头字段: {', '.join(_keys) if _keys else '(读取失败)'}\n"
+                     f"       提示：--date-scope 仅对含 BeginDate/EndDate 列的 query 生效，"
+                     f"套在其他接口上会滤成 0 条；请去掉该参数或改选「不限」")
         sys.exit(f"[FAIL] {excel} 中无有效用例（表头之后没有数据行）")
     print(f"[INFO] 读取用例 {len(cases)} 条，耗时 {_read_dt:.2f}s")
     # --cases 过滤：按用例编号/行号指定发送（先于 --type，行号对齐 Excel 原始顺序）

@@ -13,6 +13,7 @@
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -1238,6 +1239,80 @@ class MainWindow(QWidget):
         """返回勾选的接口名列表"""
         return [n for n, chk in self.chk_ifaces.items() if chk.isChecked()]
 
+    def _iface_has_date_cols(self, name):
+        """该接口的 Excel 是否含 BeginDate/EndDate 列（只有 query 有）。
+
+        为什么需要它：--date-scope 是「全局」设置（存在 config.ini），
+        但只有 query 的表有日期列；其他接口带了这个参数会被过滤成 0 条，
+        报"表中无有效用例"，看起来像 Excel 坏了。
+        0920 事故就是先给 query 选了「当日」，再切 acc_sign -> 全滤空。
+        结果按文件名+修改时间缓存，避免每次拼命令行都读一遍 Excel。
+        """
+        path = os.path.join(DATA_DIR, f"{name}.xlsx")
+        try:
+            stamp = os.path.getmtime(path)
+        except OSError:
+            return False          # Excel 不存在：保守当作"没有日期列"，不传该参数
+        cache = getattr(self, "_date_col_cache", None)
+        if cache is None:
+            cache = self._date_col_cache = {}
+        hit = cache.get(name)
+        if hit and hit[0] == stamp:
+            return hit[1]
+        has = False
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(path, read_only=True, data_only=True)
+            try:
+                ws = wb.active
+                header = next(ws.iter_rows(values_only=True))
+                keys = set()
+                for h in header:
+                    m = re.search(r"\(([A-Za-z_][A-Za-z0-9_]*)\)", str(h))
+                    keys.add(m.group(1) if m else str(h).strip())
+                has = "BeginDate" in keys and "EndDate" in keys
+            finally:
+                wb.close()
+        except Exception:
+            has = False
+        cache[name] = (stamp, has)
+        return has
+
+    def _usable_date_scope(self, names):
+        """本次勾选的接口里，有时间窗参数的（即真正适用的接口）。"""
+        return [n for n in names if self._iface_has_date_cols(n)]
+
+    def _date_scope_for(self, name):
+        """当前接口该带的 --date-scope 值；不适用则返回 ""（不传）。
+
+        非 query 接口即使下拉框残留旧值也不下发，并在日志里说明一次，
+        避免"静默 0 条"这种难查的故障。
+        """
+        ds = self.combo_date_scope.currentData()
+        if not ds:
+            return ""
+        if self._iface_has_date_cols(name):
+            return ds
+        self._warn_date_scope_skipped(name, ds)
+        return ""
+
+    def _warn_date_scope_skipped(self, name, ds):
+        """提示一次：该接口无日期列，时间窗参数已跳过。"""
+        done = getattr(self, "_date_scope_warned", None)
+        if done is None:
+            done = self._date_scope_warned = set()
+        key = (name, ds)
+        if key in done:
+            return
+        done.add(key)
+        try:
+            self.append_log(
+                f"[WARN] 接口 {name} 的表没有 BeginDate/EndDate 列，"
+                f"已自动跳过「查询时间窗={ds}」参数"
+                f"（该参数仅对 query 生效；若照发会把用例全滤掉显示 0 条）")
+        except Exception:
+            pass
+
     def _set_all_iface(self, checked):
         for chk in self.chk_ifaces.values():
             chk.setChecked(checked)
@@ -1263,15 +1338,24 @@ class MainWindow(QWidget):
         self.combo_date_scope.setEnabled(usable)
         if hasattr(self, "lbl_date_scope"):
             self.lbl_date_scope.setEnabled(usable)
+        # 关键提示：此项是【全局】设置，会一直留在 config.ini。
+        # 若残留了值而当前勾选的接口都不是 query，参数会自动跳过（不会滤成 0 条），
+        # 但要在界面上说清楚，避免用户以为它还在生效。
+        _stale = bool(self.combo_date_scope.currentData()) and sel and not usable
         _base = ("按 query 的 Begin/EndDate 时间窗筛选用例（仅 query 类接口适用）：\n"
                  "· 当日 = BeginDate/EndDate 均为 __TODAY__ 的用例（3334 条，查 Redis）\n"
                  "· 当月 / 当年 = 查数据库的用例\n"
                  "压测 Redis 时选「当日」，避免按月/按年的请求打到数据库。\n"
                  "留「不限」= 全部用例（含按月/按年）")
-        self.combo_date_scope.setToolTip(
-            _base if usable else
-            _base + "\n【当前未勾选 query 接口 → 此项不生效】\n"
-                    "只有 query 的表有 BeginDate/EndDate 列；其他接口用了会过滤成 0 条")
+        if usable:
+            tip = _base
+        else:
+            tip = (_base + "\n【当前未勾选 query 接口 → 此项不生效】\n"
+                           "只有 query 的表有 BeginDate/EndDate 列；"
+                           "其他接口会自动跳过该参数，不会被滤成 0 条。")
+            if _stale:
+                tip += ("\n\n⚠ 当前保存的时间窗值会被跳过（建议改回「不限」以免混淆）")
+        self.combo_date_scope.setToolTip(tip)
 
     def update_excel_label(self):
         self.update_interfaces_label()
@@ -1704,8 +1788,10 @@ class MainWindow(QWidget):
         if cases_spec:
             parts.append("--cases")
             parts.append(cases_spec)
-        _ds = self.combo_date_scope.currentData()
-        if _ds:                       # "" = 不限，不传
+        # 查询时间窗只在接口确有日期列时下发（见 _date_scope_for）：
+        # 全局设置残留旧值时，非 query 接口带上会被滤成 0 条
+        _ds = self._date_scope_for(name)
+        if _ds:                       # "" = 不限/不适用，不传
             parts.append("--date-scope")
             parts.append(_ds)
         _acc = self.edit_accounts.text().strip()
@@ -1841,7 +1927,8 @@ class MainWindow(QWidget):
         # 查询时间窗 / 指定账号：与普通发送一致，一并透传给 soak。
         # 此前只有 build_send_cmd 传了这两个参数，soak 命令漏传 → GUI 里选「查询时间窗」
         # 对稳定性测试不生效（soak 会发全部用例）。补上后两处行为一致。
-        _ds = self.combo_date_scope.currentData()
+        # 时间窗同样要按接口是否有日期列判断（见 _date_scope_for），否则非 query 全滤空。
+        _ds = self._date_scope_for(name)
         if _ds:
             parts += ["--date-scope", _ds]
         _acc = self.edit_accounts.text().strip()
