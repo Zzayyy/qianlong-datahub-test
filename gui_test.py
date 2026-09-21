@@ -430,6 +430,8 @@ DEFAULT_CONFIG = {
     "bulk_accounts": "0",  # acc_sign 批量账号行数（N 行不同账号的正常数据；0=不启用）
     "bulk_start": "0",     # 批量账号起始序号（0=接口默认 011301）
     "preview": "0",      # 预览模式（--no-send，只生成报文不发送）
+    "no_reply": "0",     # 只发不收（--no-reply：不请求/不累积/不统计回复）
+    "rate": "0",         # 限速条/s（--rate，0=不限速）
     "soak": "0",         # 稳定性测试(Soak) 开关
     "soak_hours": "8",   # Soak 总时长（小时）
     "soak_batch": "1000",  # Soak 每轮条数
@@ -797,6 +799,34 @@ class MainWindow(QWidget):
         self.chk_destroy_plugin.setChecked(self.cfg.get("destroy_via_plugin", "0") == "1")
         g2.addWidget(self.chk_destroy_plugin, 3, 2, 1, 2)
 
+        # 行3.5：只发不收（--no-reply）+ 限速（--rate）
+        # 用于"分段查找内存泄漏点"：被测环节可能被砍掉回复，本进程收不到回复也照跑
+        self.chk_no_reply = QCheckBox("只发不收 (不请求/不统计回复)")
+        self.chk_no_reply.setChecked(self.cfg.get("no_reply", "0") == "1")
+        self.chk_no_reply.setToolTip(
+            "只负责发数据，不收回复——用于分段查找内存泄漏点：\n"
+            "· 不请求回复、不累积回复、不打印回复（也避免了回复列表自身占内存，"
+            "否则会干扰泄漏测量）\n"
+            "· 汇总里「期望/收到/缺回复/回复率」显示 N/A(未收回复)，"
+            "不会把\"主动不收\"误报成\"中台没回\"\n"
+            "· 该模式下不等回复（--wait 立即返回），每轮不会白等\n"
+            "\n"
+            "适用：砍掉回复后（中台不回/不回写回复流）仍要稳定压测。\n"
+            "关闭时（默认）行为与原来完全一致：正常收回复并统计。")
+        g2.addWidget(self.chk_no_reply, 5, 0, 1, 2)
+
+        self.spin_rate = QDoubleSpinBox()
+        self.spin_rate.setRange(0, 1000000)
+        self.spin_rate.setDecimals(1)
+        self.spin_rate.setValue(float(self.cfg.get("rate", "0")))
+        self.spin_rate.setToolTip(
+            "限速：每秒最多发送 N 条（0 = 不限速，默认）。\n"
+            "按均匀间隔投递（匀速），适合长时间稳跑/测内存泄漏——\n"
+            "不限速时每秒数千条，内存曲线很快到底，反而不易定位拐点。\n"
+            "多进程(procs>1)时按总速率均分到各进程。")
+        g2.addWidget(self.spin_rate, 5, 2)
+        g2.addWidget(QLabel("限速 条/s (0=不限)"), 5, 3)
+
         # 行4：用例类型过滤（--type）
         g2.addWidget(QLabel("用例类型:"), 4, 0)
         type_box = QHBoxLayout()
@@ -812,7 +842,7 @@ class MainWindow(QWidget):
 
         # 行5：破坏测试类型（直写 Redis 时生效；两个维度组合：核心字段 × task 内容）
         self.lbl_destroy_mode = QLabel("破坏类型:")
-        g2.addWidget(self.lbl_destroy_mode, 5, 0)
+        g2.addWidget(self.lbl_destroy_mode, 6, 0)
         self.combo_destroy_mode = QComboBox()
         self.combo_destroy_mode.addItem("type1 乱填字段+业务畸形 (测:路由+业务校验)", "type1")
         self.combo_destroy_mode.addItem("type2 乱填字段+业务正确 (测:路由)", "type2")
@@ -830,11 +860,11 @@ class MainWindow(QWidget):
             "type4：核心字段正常 + task合法JSON但非协议格式 —— 破坏③，测未知结构的分发容错\n"
             "mixed：四种按顺序轮发\n"
             "对比：error用例走插件，task合法且协议格式，只破坏④业务校验")
-        g2.addWidget(self.combo_destroy_mode, 5, 1, 1, 3)
+        g2.addWidget(self.combo_destroy_mode, 6, 1, 1, 3)
         self._sync_destroy_controls()   # 破坏控件随「用例类型」联动置灰
 
         # 行6：用例编号筛选（--cases），定位中台挂掉时逐条/分段发送
-        g2.addWidget(QLabel("用例编号:"), 6, 0)
+        g2.addWidget(QLabel("用例编号:"), 7, 0)
         self.edit_cases = QLineEdit(self.cfg.get("cases", ""))
         self.edit_cases.setPlaceholderText("如 QG0001,QG5-QG10 或 100-200（空=全部）")
         self.edit_cases.setToolTip(
@@ -849,7 +879,7 @@ class MainWindow(QWidget):
             "带字母的编号位置不可预知，仍需全读。\n"
             "\n查看发送的报文：关掉安静模式可逐条打印；"
             "--no-send 预览可存 out/{接口}_requests.jsonl")
-        g2.addWidget(self.edit_cases, 6, 1, 1, 3)
+        g2.addWidget(self.edit_cases, 7, 1, 1, 3)
 
         # 行7：预览模式（--no-send，只生成报文不发送）
         self.chk_preview = QCheckBox("预览模式 (只生成报文不发送，存 out/{接口}_requests.jsonl)")
@@ -859,7 +889,7 @@ class MainWindow(QWidget):
             "· 远程执行时也在远程生成 jsonl 并自动下载到本地 out/requests/\n"
             "· 用于核对动态单号(__REFn__)展开、字段内容是否正确\n"
             "· 本地 Windows 没有 .so，不勾选也只会预览")
-        g2.addWidget(self.chk_preview, 7, 0, 1, 2)
+        g2.addWidget(self.chk_preview, 8, 0, 1, 2)
         # 行7 右半：按秒明细 CSV（配合「结束条件=按时间」看速率曲线）
         self.chk_persec_csv = QCheckBox("导出按秒明细CSV")
         self.chk_persec_csv.setChecked(self.cfg.get("persec_csv", "0") == "1")
@@ -867,11 +897,11 @@ class MainWindow(QWidget):
             "额外导出 <接口>_<时间>_persec.csv：每秒的请求数/字节/失败/CPU/流增量/平均延迟。\n"
             "可直接画速率曲线，定位「第几秒开始掉速」。\n"
             "配合「结束条件=按时间」使用效果最好（能看出速率随时间的变化）")
-        g2.addWidget(self.chk_persec_csv, 7, 2, 1, 2)
+        g2.addWidget(self.chk_persec_csv, 8, 2, 1, 2)
         # 行8：查询时间窗（--date-scope，仅 query 类接口有意义）
         # 按日查 Redis、按月/按年查库：压 Redis 时只发当日用例
         self.lbl_date_scope = QLabel("查询时间窗:")
-        g2.addWidget(self.lbl_date_scope, 8, 0)
+        g2.addWidget(self.lbl_date_scope, 9, 0)
         self.combo_date_scope = QComboBox()
         self.combo_date_scope.addItem("不限", "")
         self.combo_date_scope.addItem("当日(查Redis)", "today")
@@ -885,21 +915,21 @@ class MainWindow(QWidget):
             "· 当月 / 当年 = 查数据库的用例\n"
             "压测 Redis 时选「当日」，避免按月/按年的请求打到数据库。\n"
             "留「不限」= 全部用例（含按月/按年）")
-        g2.addWidget(self.combo_date_scope, 8, 1)
+        g2.addWidget(self.combo_date_scope, 9, 1)
 
         # 行8 右半：账号筛选（--accounts）
-        g2.addWidget(QLabel("指定账号:"), 8, 2)
+        g2.addWidget(QLabel("指定账号:"), 9, 2)
         self.edit_accounts = QLineEdit(self.cfg.get("accounts", ""))
         self.edit_accounts.setPlaceholderText("如 010100011301,010100011304（空=全部）")
         self.edit_accounts.setToolTip(
             "只发指定账号的用例（精确匹配 Excel「云单账号」列，逗号分隔）。\n"
             "与「查询时间窗」可叠加：如只发某几个账号的当日查询。\n"
             "未匹配到的账号会在日志里 WARN 提示")
-        g2.addWidget(self.edit_accounts, 8, 3)
+        g2.addWidget(self.edit_accounts, 9, 3)
         self._sync_date_scope_control()   # 时间窗随勾选的接口联动
 
         # 行9：多进程并行（--procs，每进程独立插件连接；突破单连接吞吐）
-        g2.addWidget(QLabel("并行进程数:"), 9, 0)
+        g2.addWidget(QLabel("并行进程数:"), 10, 0)
         self.spin_procs = QSpinBox()
         self.spin_procs.setRange(1, 32)
         self.spin_procs.setValue(int(self.cfg.get("procs", "1")))
@@ -907,7 +937,7 @@ class MainWindow(QWidget):
             "把用例自动按行号均分到 N 个进程，各进程独立 CreateMQ/插件连接并行发送，"
             "用于突破单插件连接吞吐瓶颈（如 10000 条/秒目标）；需远程 Linux + .so。\n"
             "并行时\"最多条数\"按全部进程合计均分，不会发成 N×max")
-        g2.addWidget(self.spin_procs, 9, 1, 1, 3)
+        g2.addWidget(self.spin_procs, 10, 1, 1, 3)
 
         # 行9：稳定性测试(Soak) 开关 —— 长时间连续跑 + 趋势聚合（由“运行稳定性测试”按钮触发）
         self.chk_soak = QCheckBox("稳定性测试(Soak，长时间连续跑/趋势汇总)")
@@ -918,7 +948,7 @@ class MainWindow(QWidget):
             "· 结束条件可选：按时长（默认 8 小时）或按轮数（短测用，跑够 N 轮自动收尾）\n"
             "· 只输出 trend.csv / summary.json / soak.log（避免海量日志/表格）\n"
             "· 需远程 Linux + .so；本地 Windows 无法真实发送")
-        g2.addWidget(self.chk_soak, 10, 0, 1, 4)
+        g2.addWidget(self.chk_soak, 11, 0, 1, 4)
 
         # 行11：Soak 参数区 —— 独立容器，随「稳定性测试」勾选显示/隐藏（方案B）
         self.soak_params = QWidget()
@@ -1002,7 +1032,7 @@ class MainWindow(QWidget):
         gs.addWidget(self.chk_soak_nohup, 12, 0, 1, 4)
         self.chk_soak_nohup.toggled.connect(self._sync_soak_nohup)
 
-        g2.addWidget(self.soak_params, 11, 0, 1, 4)
+        g2.addWidget(self.soak_params, 12, 0, 1, 4)
         # 勾选切换时展开/收起参数区；并同步时长/轮数的启用状态
         self.chk_soak.toggled.connect(self._sync_soak_visibility)
         self._sync_soak_visibility()
@@ -1800,6 +1830,14 @@ class MainWindow(QWidget):
             parts.append(_acc)
         if self.chk_preview.isChecked():
             parts.append("--no-send")
+        # 只发不收：不请求/不累积/不统计回复（用于砍掉回复后仍稳定压测）
+        if self.chk_no_reply.isChecked():
+            parts.append("--no-reply")
+        # 限速：0=不下发（默认不限速，行为与原来一致）
+        _rate = self.spin_rate.value()
+        if _rate > 0:
+            parts.append("--rate")
+            parts.append(f"{_rate:g}")
         if self.chk_mock.isChecked():
             parts.append("--mock")
         else:
@@ -1943,6 +1981,13 @@ class MainWindow(QWidget):
             parts += ["--type", ",".join(types)]
         if self.chk_preview.isChecked():
             parts.append("--no-send")
+        # 只发不收 / 限速：与普通发送一致，一并透传给 soak（soak 原样转发给 send_test）
+        if self.chk_no_reply.isChecked():
+            parts.append("--no-reply")
+        _rate = self.spin_rate.value()
+        if _rate > 0:
+            parts.append("--rate")
+            parts.append(f"{_rate:g}")
         if self.chk_mock.isChecked():
             parts.append("--mock")
         else:
@@ -1998,6 +2043,8 @@ class MainWindow(QWidget):
             "bulk_accounts": str(self.spin_bulk_accounts.value()),
             "bulk_start": str(self.spin_bulk_start.value()),
             "preview": "1" if self.chk_preview.isChecked() else "0",
+            "no_reply": "1" if self.chk_no_reply.isChecked() else "0",
+            "rate": f"{self.spin_rate.value():g}",
             "destroy_via_plugin": "1" if self.chk_destroy_plugin.isChecked() else "0",
             "destroy_mode": self.combo_destroy_mode.currentData() or "mixed",
             "soak": "1" if self.chk_soak.isChecked() else "0",

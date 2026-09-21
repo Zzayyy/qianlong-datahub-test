@@ -130,6 +130,7 @@ class PerfStats:
         self.reply_got = 0             # 实际收到的中台回复数（wait_replies 结束后写入）
         self.reply_expect = 0          # 期望回复数（走插件的用例数；destroy 直写无回复预期）
         self.reply_recorded = False    # 是否已写入回复结果（未记录时汇总显示 N/A）
+        self.reply_disabled = False    # --no-reply：只发不收，回复四项不统计（显示 N/A）
         self.bytes_ok = 0              # 成功请求的字节
         self.bytes_fail = 0            # 失败请求的字节
         self._sampler = None
@@ -198,6 +199,19 @@ class PerfStats:
             self.reply_got = got
             self.reply_expect = max(0, expect)
             self.reply_recorded = True
+
+    def disable_reply_stats(self, expect=0):
+        """--no-reply 模式：只发不收，回复四项整体记为 N/A。
+
+        为什么不能只靠"收不到回复"来体现：中台被砍掉回复时，
+        本进程永远收不到消息，汇总会显示 收到0/期望N 缺N 回复率0%，
+        看起来像"中台故障"，而实际是本次运行主动不请求回复。
+        故显式标记，让汇总显示 N/A 而非 0，避免误判。
+        """
+        with self.lock:
+            self.reply_disabled = True
+            self.reply_got = 0
+            self.reply_expect = max(0, expect)
 
     # ---------- 采样线程 ----------
     def start(self, interval=1.0):
@@ -349,12 +363,19 @@ class PerfStats:
                 "每秒采样点数": len(self.per_sec),
                 # 中台回复：发送成功/失败只代表"递交成功"，回复情况在此单列，
                 # 中台中途崩溃时期望回复>0 而收到回复不足，缺回复/回复率可暴露
-                "期望回复数": self.reply_expect if self.reply_recorded else "N/A",
-                "收到回复数": self.reply_got if self.reply_recorded else "N/A",
-                "缺回复数": (max(self.reply_expect - self.reply_got, 0)
-                            if self.reply_recorded and self.reply_expect > 0 else "N/A"),
-                "回复率%": ((self.reply_got / self.reply_expect * 100)
-                           if self.reply_recorded and self.reply_expect > 0 else "N/A"),
+                # --no-reply（只发不收）时整体记 N/A：这不是"中台没回"，
+                # 而是本次运行主动不要回复，记 0 会被误读成中台故障。
+                "期望回复数": ("N/A(未收回复)" if self.reply_disabled
+                               else (self.reply_expect if self.reply_recorded else "N/A")),
+                "收到回复数": ("N/A(未收回复)" if self.reply_disabled
+                               else (self.reply_got if self.reply_recorded else "N/A")),
+                "缺回复数": ("N/A(未收回复)" if self.reply_disabled
+                             else (max(self.reply_expect - self.reply_got, 0)
+                                   if self.reply_recorded and self.reply_expect > 0 else "N/A")),
+                "回复率%": ("N/A(未收回复)" if self.reply_disabled
+                            else ((self.reply_got / self.reply_expect * 100)
+                                  if self.reply_recorded and self.reply_expect > 0 else "N/A")),
+                "回复统计": "关闭(--no-reply 只发不收)" if self.reply_disabled else "开启",
                 # 数据中台未开放
                 "返回字节(B)": "N/A(数据中台未开放)",
                 "业务响应时间(µs)": "N/A(数据中台未开放)",

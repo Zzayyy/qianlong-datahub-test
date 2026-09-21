@@ -391,10 +391,15 @@ _ReplyCb = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p
 class DataHubClient:
     """封装 libdatahub_trade_plug.so 的 C API"""
 
-    def __init__(self, so_path, unique="test", cfg_path=None, reply_flag=0):
+    def __init__(self, so_path, unique="test", cfg_path=None, reply_flag=0,
+                 collect_replies=True):
         if cfg_path is None:
             cfg_path = BASE_DIR + "/"
         self.reply_flag = reply_flag
+        # collect_replies=False（--no-reply）：只发不收。
+        # 回调里不累积 _replies，避免中台持续回复时列表无界增长——
+        # 那会污染"分段查找内存泄漏点"的测量（泄漏可能压根不在被测程序里）。
+        self.collect_replies = collect_replies
         self.lib = ctypes.CDLL(so_path)
         self.lib.CreateMQ.argtypes = [ctypes.c_char_p, ctypes.c_char_p, _ReplyCb]
         self.lib.CreateMQ.restype = ctypes.c_void_p
@@ -411,6 +416,10 @@ class DataHubClient:
         def _on_msg(msg_id, data1, data2):
             s1 = data1.decode("utf-8", "replace") if data1 else ""
             s2 = data2.decode("utf-8", "replace") if data2 else ""
+            if not self.collect_replies:
+                # 只发不收：直接丢弃，不建列表、不打印。
+                # 注意回调本身仍注册着（插件要求），但这里不产生任何累积。
+                return
             with self._lock:
                 self._replies.append((s2, s1))
                 n = len(self._replies)
@@ -466,7 +475,12 @@ class DataHubClient:
 
         expected<=0 表示不限条数，退化为固定等待 timeout 秒（保持旧行为）。
         返回实际收到的条数。
+
+        --no-reply（collect_replies=False）时不再等待：本就不收回复，
+        干等 timeout 秒纯粹浪费时间（分段测泄漏时每段都要白等，很痛）。
         """
+        if not self.collect_replies:
+            return 0
         self._expect = max(0, expected)
         if self._expect and self.reply_count >= self._expect:
             return self.reply_count          # 发送期间就已收齐
@@ -891,6 +905,10 @@ def run_multi_procs(args, mod, excel, total_rows):
     proc_dirs = [os.path.join(stats_root, f"proc{i + 1}") for i in range(args.procs)]
     base = _argv_without_key(sys.argv[1:], "--procs")
     base = _argv_without_key(base, "--max")   # --max 是"全部进程合计上限"，由下面按进程均分
+    # --rate 是"全部进程合计速率"：若原样透传，N 个进程各发 N 条/s -> 总速率变成 N 倍。
+    # 故从 base 摘掉，改为每进程分得 rate/N（余数不追，保持简单且不超过总上限）。
+    base = _argv_without_key(base, "--rate")
+    per_rate = (args.rate / args.procs) if args.rate and args.rate > 0 else 0.0
     # --max M>0 表示总目标条数：均分到各进程（余数给前几个），避免每进程各自循环满 M -> N×M
     per = args.max // args.procs if args.max else 0
     rem = args.max % args.procs if args.max else 0
@@ -907,8 +925,11 @@ def run_multi_procs(args, mod, excel, total_rows):
         cmd = [sys.executable, script] + base + [
             "--procs", "1", "--cases", f"{a}-{b}", "--max", str(per_max),
             "--stats-out", proc_dirs[i]]
+        if per_rate > 0:
+            cmd += ["--rate", f"{per_rate:g}"]
         print(f"[PROC{i + 1}] 数据行 {a}-{b} -> {os.path.relpath(proc_dirs[i], stats_root)}"
-              f"（该进程最多 {per_max or '本段全部'} 条）")
+              f"（该进程最多 {per_max or '本段全部'} 条"
+              + (f"，限速 {per_rate:g} 条/s" if per_rate > 0 else "") + "）")
         env = dict(os.environ)
         env["SEND_RUN_SUFFIX"] = f"_p{i + 1}"
         children.append(_sp.Popen(cmd, env=env))
@@ -997,6 +1018,40 @@ def show_reply_streams():
           f"（redis-cli，SELECT {REDIS_SELECT}）")
 
 
+class _RateLimiter:
+    """匀速限速器：第 n 条允许发送的时刻 = start + n / rate。
+
+    用绝对时刻（而非"发完再 sleep 固定间隔"）算目标，好处是发送本身耗时
+    不会累积成漂移；若投递慢于目标速率，则不再额外等待（退化为尽力而为）。
+    rate<=0 时 wait() 立即返回，默认路径零开销、行为不变。
+    """
+
+    def __init__(self, rate):
+        self.rate = max(0.0, float(rate or 0.0))
+        self.start = time.perf_counter()
+        self.n = 0
+        # do_send 由线程池并发调用，n 的自增必须加锁，
+        # 否则多个线程会拿到同一个序号、挤在同一时刻发送（限速失效）
+        self._lock = threading.Lock()
+
+    @property
+    def enabled(self):
+        return self.rate > 0
+
+    def wait(self):
+        """等到第 (n+1) 条该发的时刻；返回等待秒数（0=没等）。"""
+        if self.rate <= 0:
+            return 0.0
+        with self._lock:
+            self.n += 1
+            target = self.start + self.n / self.rate
+        now = time.perf_counter()
+        if target > now:
+            time.sleep(target - now)
+            return target - now
+        return 0.0
+
+
 # ==================== 主流程 ====================
 def main():
     ap = argparse.ArgumentParser(description="通用多线程压测")
@@ -1035,6 +1090,15 @@ def main():
                          "可直接画速率曲线，定位掉速发生在第几秒")
     ap.add_argument("--wait", type=float, default=3.0, help="发完后等待回复秒数")
     ap.add_argument("--reply", type=int, default=0, choices=[0, 1], help="reply_flag")
+    ap.add_argument("--no-reply", dest="no_reply", action="store_true",
+                    help="只发不收：不请求回复、不累积回复、不统计回复四项（记 N/A）。"
+                         "用于分段查找内存泄漏点——被测环节可能被砍掉回复，"
+                         "此时本进程收不到任何回复也不该受影响。"
+                         "该模式下 --wait 不再空等（立即返回）")
+    ap.add_argument("--rate", type=float, default=0.0,
+                    help="限速：每秒最多发送 N 条（0=不限，默认）。"
+                         "按均匀间隔投递（匀速），适合长时间稳跑/泄漏测试；"
+                         "与 --workers 并用时以本参数为总速率上限")
     ap.add_argument("--init-wait", type=float, default=5.0, help="等待插件 inited 最大秒数(兜底超时，正常2-3s即探测到)")
     ap.add_argument("--mock", action="store_true", default=True, help="启动模拟应答器")
     ap.add_argument("--no-mock", dest="mock", action="store_false", help="关闭模拟应答器")
@@ -1285,7 +1349,14 @@ def main():
             raise SystemExit("mock 订阅未就绪，无法继续")
 
     # ---------- 2) CreateMQ：插件上线后即刻被 mock 应答 ----------
-    client = DataHubClient(so, unique=mod.NAME, reply_flag=args.reply)
+    # --no-reply：关闭回复收集（不建列表、不打印、不等回复）
+    client = DataHubClient(so, unique=mod.NAME, reply_flag=args.reply,
+                           collect_replies=not args.no_reply)
+    if args.no_reply and stats:
+        stats.disable_reply_stats()
+    if args.no_reply:
+        print("[INFO] 只发不收模式(--no-reply)：不请求/不累积/不统计回复，"
+              "收不到回复属正常，不影响发送")
 
     try:
         if not client.wait_ready(timeout=args.init_wait):
@@ -1310,7 +1381,13 @@ def main():
 
         # 1) 插件发送（normal + error）
         if plugin_cases:
+            # --rate：匀速限速（rate<=0 时 wait() 是空操作，默认路径不变）
+            limiter = _RateLimiter(args.rate)
+            if limiter.enabled:
+                print(f"[INFO] 限速 --rate {limiter.rate:g} 条/s（匀速投递）")
+
             def do_send(p, req_id):
+                limiter.wait()          # 先按目标速率节流，再发
                 t0 = time.perf_counter()
                 ret = client.send(p, req_id)
                 us = (time.perf_counter() - t0) * 1e6
@@ -1443,36 +1520,46 @@ def main():
 
         # 收齐即停：期望条数 = 走插件的用例数（destroy 直写 Redis，不产生插件回复）
         expect = len(plugin_cases)
-        if expect:
-            print(f"[INFO] 等待回复（最多 {args.wait}s，收齐 {expect} 条即停）...")
-            got = client.wait_replies(expect, args.wait)
-            if got >= expect:
-                print(f"[RESULT] 收到回复数: {got}/{expect}（已收齐，提前结束等待）")
-            else:
-                print(f"[RESULT] 收到回复数: {got}/{expect}（超时未收齐，缺 {expect - got} 条）")
+        if args.no_reply:
+            # 只发不收：不等待、不统计、不打印回复样例（收不到回复属预期）
+            print(f"[INFO] --no-reply 已开启：跳过等待回复（本次不发请求回复，"
+                  f"共递交 {expect} 条）")
+            if stats:
+                stats.disable_reply_stats(expect)
         else:
-            print(f"[INFO] 无走插件的用例，等待 {args.wait}s 收集残留回复...")
-            got = client.wait_replies(0, args.wait)
-            print(f"[RESULT] 收到回复数: {got}")
-        # 中台回复写入统计：汇总表的成功/失败只统计到"递交"（SendMQ/XADD 返回），
-        # 中台中途崩溃、请求已递交但无回复时，必须靠"收到回复数/缺回复数"暴露
-        if stats:
-            stats.set_reply_result(got, expect)
-        with client._lock:
-            sample = client._replies[:10]
-        for rid, data in sample:
-            _sep("reply sample")
-            print(f"    req_id={rid} -> {data[:200]}")
+            if expect:
+                print(f"[INFO] 等待回复（最多 {args.wait}s，收齐 {expect} 条即停）...")
+                got = client.wait_replies(expect, args.wait)
+                if got >= expect:
+                    print(f"[RESULT] 收到回复数: {got}/{expect}（已收齐，提前结束等待）")
+                else:
+                    print(f"[RESULT] 收到回复数: {got}/{expect}（超时未收齐，缺 {expect - got} 条）")
+            else:
+                print(f"[INFO] 无走插件的用例，等待 {args.wait}s 收集残留回复...")
+                got = client.wait_replies(0, args.wait)
+                print(f"[RESULT] 收到回复数: {got}")
+            # 中台回复写入统计：汇总表的成功/失败只统计到"递交"（SendMQ/XADD 返回），
+            # 中台中途崩溃、请求已递交但无回复时，必须靠"收到回复数/缺回复数"暴露
+            if stats:
+                stats.set_reply_result(got, expect)
+            with client._lock:
+                sample = client._replies[:10]
+            for rid, data in sample:
+                _sep("reply sample")
+                print(f"    req_id={rid} -> {data[:200]}")
 
         # ---- create 回填：把中台返回的实际 Ref 落盘（真实中台才有业务回复）----
         if mod.NAME == "create":
-            ref_rows = collect_create_refs(list(client._replies), cases)
-            refs_dir = args.stats_out or os.path.join(BASE_DIR, "out", "performance")
-            p = save_refs_file(ref_rows, refs_dir, mod.NAME, tag=_run_suffix)
-            if p:
-                print(f"[REFS] create 返回 Ref 已落盘: {p}（{len(ref_rows)} 条）")
+            if args.no_reply:
+                print("[REFS] --no-reply 模式不收回复，跳过 create Ref 回填")
             else:
-                print("[REFS] 未解析到 create 业务 Ref（mock 不答业务，需真实中台）")
+                ref_rows = collect_create_refs(list(client._replies), cases)
+                refs_dir = args.stats_out or os.path.join(BASE_DIR, "out", "performance")
+                p = save_refs_file(ref_rows, refs_dir, mod.NAME, tag=_run_suffix)
+                if p:
+                    print(f"[REFS] create 返回 Ref 已落盘: {p}（{len(ref_rows)} 条）")
+                else:
+                    print("[REFS] 未解析到 create 业务 Ref（mock 不答业务，需真实中台）")
 
     finally:
         if mock:
