@@ -1384,8 +1384,29 @@ class MainWindow(QWidget):
         hdr.setDefaultSectionSize(84)
         hdr.setMinimumSectionSize(60)
         hdr.resizeSection(0, 130)
-        for _ci, _w in {1: 92, 2: 92, 3: 92, 4: 88, 5: 96, 6: 96, 7: 84, 8: 88}.items():
-            hdr.resizeSection(_ci, _w)
+        # 列宽按【表头文字实测宽度】定，避免表头被截断（"等待回复耗时(s)" 曾显示成
+        # "等待回复耗时("、"SendMQ均(µs)" 显示成 "SendMQ均(" —— 第 15/18 列）。
+        # 数值留 16px 左右内边距；下方给出不小于实测值的宽度。
+        # 宽度来源：QFontMetrics(headers[i]) + 16，见下方注释中的实测值。
+        _COL_W = {
+            1: 92, 2: 92, 3: 92, 4: 88,          # 总请求数/发送成功/发送失败/成功率%
+            5: 96, 6: 96, 7: 84, 8: 88,          # 期望回复/收到回复/缺回复/回复率%
+            9: 88,                               # 吞吐(条/s)
+            10: 88, 11: 88,                      # CPU平均%/CPU峰值%
+            12: 84,                              # Redis写入
+            13: 96,                              # 初始化耗时(s)   实测需 90
+            14: 90,                              # 发送耗时(s)     实测需 78
+            15: 108,                             # 等待回复耗时(s)  实测需 102 ← 曾被截断
+            16: 84,                              # 总耗时(s)
+            17: 84,                              # 请求KB/s
+            18: 108,                             # SendMQ均(µs)    实测需 101 ← 曾被截断
+            19: 72, 20: 72, 21: 72, 22: 76,      # p50/p90/p99/max(µs)
+            23: 92,                              # XADD均(µs)      实测需 84
+            24: 104,                             # XADD p99(µs)    实测需 98 ← 曾被截断
+        }
+        for _ci, _w in _COL_W.items():
+            if _ci < len(SUMMARY_COLS):
+                hdr.resizeSection(_ci, _w)
         self.table_summary.setToolTip(
             "发送成功/发送失败 = 请求是否成功递交（走插件看 SendMQ 返回，破坏直写看 XADD 写流），\n"
             "不代表中台已处理。中台是否回复看「期望/收到/缺回复/回复率」列：\n"
