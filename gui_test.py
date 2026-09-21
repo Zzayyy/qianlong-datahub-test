@@ -21,13 +21,13 @@ import time
 # 屏蔽 Qt 在 Windows 上枚举旧系统字体失败的无害警告（Fixedsys/MS Sans Serif 等）
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts.warning=false")
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QEvent
 from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QPushButton, QSpinBox,
     QDoubleSpinBox, QCheckBox, QLineEdit, QTextEdit, QGroupBox,
     QGridLayout, QVBoxLayout, QHBoxLayout, QMessageBox,
-    QListWidget, QListWidgetItem, QAbstractItemView,
+    QListWidget, QListWidgetItem, QAbstractItemView, QAbstractSpinBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter, QFileDialog,
     QTabWidget, QToolButton, QScrollArea, QFrame, QSizePolicy,
 )
@@ -39,6 +39,86 @@ PYTHON = sys.executable
 
 # 日志区最大行数：超出后丢弃最旧的行，防止日志过多导致界面卡死
 MAX_LOG_LINES = 3000
+
+
+# ==================== 滚轮防误改 ====================
+class WheelGuard(QObject):
+    """让 SpinBox/ComboBox 不再"滚轮悬停即改值"，改为滚动外层滚动区。
+
+    背景：Qt 的 QAbstractSpinBox / QComboBox 默认把滚轮当作"改值"操作。
+    在「发送参数」这种内容超高、需要滚动的面板里，用户只想滚页面，
+    鼠标划过输入框却把参数改了——而且常常没察觉（如把 10000 改成 9999）。
+
+    【不能用 hasFocus() 判断】——这是踩过的坑：
+      这些控件的 focusPolicy 默认是 Qt.WheelFocus(15)，含义包含
+      "鼠标滚轮也能让它获得焦点"。真实流程是：
+        滚轮事件到达 -> Qt 先把焦点给该控件 -> 再投递给它
+      所以过滤器里读到的 hasFocus() 恒为 True，永远走"放行"分支，
+      防护形同虚设。实测：发事件前 spin.hasFocus()=False，
+      过滤器被调用时已变成 True。
+      （早期用 sendEvent 直接投给控件测试时看不到这个问题，因为那条路径
+       不经过 Qt 的焦点处理，导致"测试通过、真机失效"。）
+
+    改用【显式交互】判断：只有用户真正点进来（或键盘/程序改过）才允许
+    滚轮微调。判据 = 该控件（或其内部子控件，如 SpinBox 的 QLineEdit）
+    当前持有【真实焦点】，且该焦点不是滚轮自己抢来的。
+    做法：单独监听 FocusIn 事件 + 记录是否由滚轮触发。
+    简化实现：把焦点策略改成 StrongFocus（去掉"滚轮可获焦"），
+    这样滚轮不再抢焦点，hasFocus() 就恢复成"用户主动聚焦"的可靠信号。
+    """
+
+    def _has_user_focus(self, obj):
+        """obj 或其内部子控件（如 SpinBox 的 QLineEdit）当前是否持有焦点。
+
+        SpinBox 被点击时，真实焦点在其内部 QLineEdit 上；只判断 obj.hasFocus()
+        会把"用户已点进来"误判为未聚焦，导致滚轮微调失效。
+        """
+        if obj.hasFocus():
+            return True
+        for child in obj.findChildren(QWidget):
+            if child.hasFocus():
+                return True
+        return False
+
+    def eventFilter(self, obj, ev):
+        if ev.type() != QEvent.Type.Wheel:
+            return False
+        if self._has_user_focus(obj):
+            return False          # 用户已聚焦：保留原生滚轮微调
+        # 转交给最近的祖先滚动区，让页面正常滚动
+        w = obj.parentWidget()
+        while w is not None:
+            if isinstance(w, QScrollArea):
+                QApplication.sendEvent(w.viewport(), ev)
+                break
+            w = w.parentWidget()
+        return True               # 吃掉，阻止改值
+
+    def install(self, *widgets):
+        """给一批控件装上。
+
+        关键：必须同时把焦点策略从 WheelFocus 降为 StrongFocus，
+        否则滚轮会先抢走焦点、让 hasFocus() 判据失效（见类注释）。
+        """
+        for w in widgets:
+            if w is None:
+                continue
+            # 去掉 "WheelFocus" 里"滚轮可获焦"的语义，只保留 Tab/点击聚焦
+            fp = w.focusPolicy()
+            if fp == Qt.FocusPolicy.WheelFocus:
+                w.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            w.installEventFilter(self)
+            # SpinBox 内部有 QLineEdit，鼠标真实落点是它；一并装上更保险
+            for child in w.findChildren(QWidget):
+                if isinstance(child, (QLineEdit, QAbstractSpinBox, QComboBox)):
+                    cfp = child.focusPolicy()
+                    if cfp == Qt.FocusPolicy.WheelFocus:
+                        child.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                    child.installEventFilter(self)
+
+
+# 全局单例：面板里所有 Spin/Combo 共用
+WHEEL_GUARD = WheelGuard()
 
 
 def list_interfaces():
@@ -557,7 +637,9 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("数据中台压力测试工具 (DataHub 压测客户端)")
-        self.resize(1380, 900)
+        # 初始尺寸按屏幕自适应：小屏（1366x768 / 1600x900）上不要超出可用区域，
+        # 否则一打开就顶到屏幕外、下方标签页看不到。
+        self.resize(*self._initial_window_size())
         self.worker = None
         self._soak_running = False   # Soak/发送任务是否在跑（决定「运行稳定性测试」是否可点）
         self.cfg = load_config()
@@ -600,9 +682,21 @@ class MainWindow(QWidget):
         self.hsplit.setChildrenCollapsible(False)
 
         # ============ 左上：主流程（1 测试数据 -> 2 发送参数 -> 运行）============
+        # 结构：left_w（不滚动，外层）
+        #         ├── left_scroll（滚动）── left_inner ── 1 测试数据 / 2 发送参数
+        #         └── btns（操作按钮，常驻底部，小屏也点得到）
+        # 为什么要滚动区：左栏内容固定很高（1+2 两块合计 800+px，且
+        # minimumSizeHint 等于内容高度），直接放进 splitter 会把窗口最小高度
+        # 顶到 1086px，展开 Soak 后下方「运行日志/批量汇总分析」被挤到 139px，
+        # 小屏（1366x768）直接溢出屏幕。包一层后可自由缩放，超出时内部滚动。
         left_w = QWidget()
-        left_lay = QVBoxLayout(left_w)
-        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_outer = QVBoxLayout(left_w)
+        left_outer.setContentsMargins(0, 0, 0, 0)
+        left_outer.setSpacing(4)
+
+        left_inner = QWidget()
+        left_lay = QVBoxLayout(left_inner)
+        left_lay.setContentsMargins(0, 0, 4, 0)
 
         # ---- 1. 测试数据（接口复选框平铺）----
         grp1 = QGroupBox("1. 测试数据 (勾选要发送的接口)")
@@ -726,20 +820,51 @@ class MainWindow(QWidget):
         gr.addWidget(self.btn_save_redis, 1, 4)
 
         # ---- 2. 发送参数 ----
+        # 按功能分区（规模与速率 / 回复处理 / 数据筛选 / 运行方式 / 稳定性测试），
+        # 用「运行行号 r」递增排版，避免手工写行号导致的错位与漏行。
         grp2 = QGroupBox("2. 发送参数")
         g2 = QGridLayout(grp2)
         # 输入列自动拉伸，让两列输入框宽度均匀分配
         g2.setColumnStretch(1, 1)
         g2.setColumnStretch(3, 1)
+        g2.setVerticalSpacing(6)
 
-        # 行0：压测规模（并发 / 结束条件）
-        g2.addWidget(QLabel("并发线程数:"), 0, 0)
+        def _section(text):
+            """分区标题：跨 4 列，带下划线分隔，视觉上把参数分组"""
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                "color:#3a5a8c; font-weight:bold; padding-top:8px;"
+                " border-bottom:1px solid #d8dee8;")
+            return lbl
+
+        r = 0
+
+        # ==================== A. 规模与速率 ====================
+        g2.addWidget(_section("规模与速率"), r, 0, 1, 4)
+        r += 1
+
+        g2.addWidget(QLabel("并发线程数:"), r, 0)
         self.spin_workers = QSpinBox()
         self.spin_workers.setRange(1, 500)
         self.spin_workers.setValue(int(self.cfg.get("workers", "4")))
-        g2.addWidget(self.spin_workers, 0, 1)
+        self.spin_workers.setToolTip(
+            "单进程内的发送线程数。发送本身是 IO 等待型，线程数可大于 CPU 核数；\n"
+            "吞吐上不去时优先调大此项，再考虑「并行进程数」。")
+        g2.addWidget(self.spin_workers, r, 1)
 
-        g2.addWidget(QLabel("结束条件:"), 0, 2)
+        g2.addWidget(QLabel("并行进程数:"), r, 2)
+        self.spin_procs = QSpinBox()
+        self.spin_procs.setRange(1, 32)
+        self.spin_procs.setValue(int(self.cfg.get("procs", "1")))
+        self.spin_procs.setToolTip(
+            "把用例自动按行号均分到 N 个进程，各进程独立 CreateMQ/插件连接并行发送，"
+            "用于突破单插件连接吞吐瓶颈（如 10000 条/秒目标）；需远程 Linux + .so。\n"
+            "并行时\"最多条数\"按全部进程合计均分，不会发成 N×max；\n"
+            "「限速」也按总速率均分到各进程。")
+        g2.addWidget(self.spin_procs, r, 3)
+        r += 1
+
+        g2.addWidget(QLabel("结束条件:"), r, 0)
         self.combo_end_mode = QComboBox()
         self.combo_end_mode.addItem("按条数", "count")
         self.combo_end_mode.addItem("按时间", "time")
@@ -749,11 +874,10 @@ class MainWindow(QWidget):
             "按条数：发够「最多条数」就停（传统压测方式）\n"
             "按时间：跑够「运行秒数」就停，用例发完自动循环续发——\n"
             "  适合测持续写入能力，配合「导出按秒明细」可看出速率随时间的变化")
-        g2.addWidget(self.combo_end_mode, 0, 3)
+        g2.addWidget(self.combo_end_mode, r, 1)
 
-        # 行0b：条数 / 秒数 两个输入框并排，按结束条件启用其一
         self.lbl_max = QLabel("最多条数(0=全部):")
-        g2.addWidget(self.lbl_max, 1, 0)
+        g2.addWidget(self.lbl_max, r, 2)
         self.spin_max = QSpinBox()
         self.spin_max.setRange(0, 10000000)
         self.spin_max.setValue(int(self.cfg.get("max", "0")))
@@ -762,10 +886,11 @@ class MainWindow(QWidget):
             "会按进程均分；不会每个进程都发满 N 次\n"
             "【结束条件=按条数时生效】按时间模式下改由「运行秒数」决定"
         )
-        g2.addWidget(self.spin_max, 1, 1)
+        g2.addWidget(self.spin_max, r, 3)
+        r += 1
 
         self.lbl_seconds = QLabel("运行秒数:")
-        g2.addWidget(self.lbl_seconds, 1, 2)
+        g2.addWidget(self.lbl_seconds, r, 0)
         self.spin_seconds = QDoubleSpinBox()
         self.spin_seconds.setRange(0.5, 86400)
         self.spin_seconds.setDecimals(1)
@@ -774,33 +899,40 @@ class MainWindow(QWidget):
             "持续发送的秒数（到点即停并收尾在飞请求）。\n"
             "用例发完后会自动从头循环续发（此时单号会重复，仅用于压流量）。\n"
             "建议配合「导出按秒明细」看每秒实际条数与延迟走势")
-        g2.addWidget(self.spin_seconds, 1, 3)
+        g2.addWidget(self.spin_seconds, r, 1)
+
+        g2.addWidget(QLabel("限速(条/s，0=不限):"), r, 2)
+        self.spin_rate = QDoubleSpinBox()
+        self.spin_rate.setRange(0, 1000000)
+        self.spin_rate.setDecimals(1)
+        self.spin_rate.setValue(float(self.cfg.get("rate", "0")))
+        self.spin_rate.setToolTip(
+            "限速：每秒最多发送 N 条（0 = 不限速，默认）。\n"
+            "按均匀间隔投递（匀速），适合长时间稳跑/测内存泄漏——\n"
+            "不限速时每秒数千条，内存曲线很快到底，反而不易定位拐点。\n"
+            "多进程(procs>1)时按总速率均分到各进程。\n"
+            "\n"
+            "注意：这是「每秒多少条」；上面的「最多条数」是「总共多少条」，两者不同。")
+        g2.addWidget(self.spin_rate, r, 3)
+        r += 1
+
         self.combo_end_mode.currentIndexChanged.connect(self._sync_end_mode)
         self._sync_end_mode()
 
-        # 行2：等待回复 / 安静模式
-        g2.addWidget(QLabel("等待回复秒数:"), 2, 0)
+        # ==================== B. 回复处理 ====================
+        g2.addWidget(_section("回复处理"), r, 0, 1, 4)
+        r += 1
+
+        g2.addWidget(QLabel("等待回复秒数:"), r, 0)
         self.spin_wait = QDoubleSpinBox()
         # 等待回复不限 300s：支持到一天（86400s），足够长压测收齐回复
         self.spin_wait.setRange(0, 86400)
         self.spin_wait.setValue(float(self.cfg.get("wait", "5.0")))
-        g2.addWidget(self.spin_wait, 2, 1)
+        self.spin_wait.setToolTip(
+            "发送结束后最多等多久收回复（收齐即提前返回，不会死等满）。\n"
+            "勾选「只发不收」时此项不生效（立即返回）。")
+        g2.addWidget(self.spin_wait, r, 1)
 
-        self.chk_quiet = QCheckBox("安静模式 (批量压测建议勾选，减少日志)")
-        self.chk_quiet.setChecked(self.cfg.get("quiet", "1") == "1")
-        g2.addWidget(self.chk_quiet, 2, 2, 1, 2)
-
-        # 行3：发送模式开关
-        self.chk_mock = QCheckBox("模拟数据中台应答器 (mock)")
-        self.chk_mock.setChecked(self.cfg.get("mock", "1") == "1")
-        g2.addWidget(self.chk_mock, 3, 0, 1, 2)
-
-        self.chk_destroy_plugin = QCheckBox("破坏数据走插件 (默认直写 Redis)")
-        self.chk_destroy_plugin.setChecked(self.cfg.get("destroy_via_plugin", "0") == "1")
-        g2.addWidget(self.chk_destroy_plugin, 3, 2, 1, 2)
-
-        # 行3.5：只发不收（--no-reply）+ 限速（--rate）
-        # 用于"分段查找内存泄漏点"：被测环节可能被砍掉回复，本进程收不到回复也照跑
         self.chk_no_reply = QCheckBox("只发不收 (不请求/不统计回复)")
         self.chk_no_reply.setChecked(self.cfg.get("no_reply", "0") == "1")
         self.chk_no_reply.setToolTip(
@@ -813,22 +945,14 @@ class MainWindow(QWidget):
             "\n"
             "适用：砍掉回复后（中台不回/不回写回复流）仍要稳定压测。\n"
             "关闭时（默认）行为与原来完全一致：正常收回复并统计。")
-        g2.addWidget(self.chk_no_reply, 5, 0, 1, 2)
+        g2.addWidget(self.chk_no_reply, r, 2, 1, 2)
+        r += 1
 
-        self.spin_rate = QDoubleSpinBox()
-        self.spin_rate.setRange(0, 1000000)
-        self.spin_rate.setDecimals(1)
-        self.spin_rate.setValue(float(self.cfg.get("rate", "0")))
-        self.spin_rate.setToolTip(
-            "限速：每秒最多发送 N 条（0 = 不限速，默认）。\n"
-            "按均匀间隔投递（匀速），适合长时间稳跑/测内存泄漏——\n"
-            "不限速时每秒数千条，内存曲线很快到底，反而不易定位拐点。\n"
-            "多进程(procs>1)时按总速率均分到各进程。")
-        g2.addWidget(self.spin_rate, 5, 2)
-        g2.addWidget(QLabel("限速 条/s (0=不限)"), 5, 3)
+        # ==================== C. 数据筛选 ====================
+        g2.addWidget(_section("数据筛选（留空=不筛选）"), r, 0, 1, 4)
+        r += 1
 
-        # 行4：用例类型过滤（--type）
-        g2.addWidget(QLabel("用例类型:"), 4, 0)
+        g2.addWidget(QLabel("用例类型:"), r, 0)
         type_box = QHBoxLayout()
         self.chk_type_normal = QCheckBox("normal")
         self.chk_type_error = QCheckBox("error")
@@ -838,11 +962,11 @@ class MainWindow(QWidget):
             type_box.addWidget(cb)
             cb.toggled.connect(self._sync_destroy_controls)
         type_box.addStretch(1)
-        g2.addLayout(type_box, 4, 1, 1, 3)
+        g2.addLayout(type_box, r, 1, 1, 3)
+        r += 1
 
-        # 行5：破坏测试类型（直写 Redis 时生效；两个维度组合：核心字段 × task 内容）
         self.lbl_destroy_mode = QLabel("破坏类型:")
-        g2.addWidget(self.lbl_destroy_mode, 6, 0)
+        g2.addWidget(self.lbl_destroy_mode, r, 0)
         self.combo_destroy_mode = QComboBox()
         self.combo_destroy_mode.addItem("type1 乱填字段+业务畸形 (测:路由+业务校验)", "type1")
         self.combo_destroy_mode.addItem("type2 乱填字段+业务正确 (测:路由)", "type2")
@@ -860,11 +984,10 @@ class MainWindow(QWidget):
             "type4：核心字段正常 + task合法JSON但非协议格式 —— 破坏③，测未知结构的分发容错\n"
             "mixed：四种按顺序轮发\n"
             "对比：error用例走插件，task合法且协议格式，只破坏④业务校验")
-        g2.addWidget(self.combo_destroy_mode, 6, 1, 1, 3)
-        self._sync_destroy_controls()   # 破坏控件随「用例类型」联动置灰
+        g2.addWidget(self.combo_destroy_mode, r, 1, 1, 3)
+        r += 1
 
-        # 行6：用例编号筛选（--cases），定位中台挂掉时逐条/分段发送
-        g2.addWidget(QLabel("用例编号:"), 7, 0)
+        g2.addWidget(QLabel("用例编号:"), r, 0)
         self.edit_cases = QLineEdit(self.cfg.get("cases", ""))
         self.edit_cases.setPlaceholderText("如 QG0001,QG5-QG10 或 100-200（空=全部）")
         self.edit_cases.setToolTip(
@@ -879,29 +1002,11 @@ class MainWindow(QWidget):
             "带字母的编号位置不可预知，仍需全读。\n"
             "\n查看发送的报文：关掉安静模式可逐条打印；"
             "--no-send 预览可存 out/{接口}_requests.jsonl")
-        g2.addWidget(self.edit_cases, 7, 1, 1, 3)
+        g2.addWidget(self.edit_cases, r, 1, 1, 3)
+        r += 1
 
-        # 行7：预览模式（--no-send，只生成报文不发送）
-        self.chk_preview = QCheckBox("预览模式 (只生成报文不发送，存 out/{接口}_requests.jsonl)")
-        self.chk_preview.setChecked(self.cfg.get("preview", "0") == "1")
-        self.chk_preview.setToolTip(
-            "勾选后构造报文但不发送（等价 --no-send）：\n"
-            "· 远程执行时也在远程生成 jsonl 并自动下载到本地 out/requests/\n"
-            "· 用于核对动态单号(__REFn__)展开、字段内容是否正确\n"
-            "· 本地 Windows 没有 .so，不勾选也只会预览")
-        g2.addWidget(self.chk_preview, 8, 0, 1, 2)
-        # 行7 右半：按秒明细 CSV（配合「结束条件=按时间」看速率曲线）
-        self.chk_persec_csv = QCheckBox("导出按秒明细CSV")
-        self.chk_persec_csv.setChecked(self.cfg.get("persec_csv", "0") == "1")
-        self.chk_persec_csv.setToolTip(
-            "额外导出 <接口>_<时间>_persec.csv：每秒的请求数/字节/失败/CPU/流增量/平均延迟。\n"
-            "可直接画速率曲线，定位「第几秒开始掉速」。\n"
-            "配合「结束条件=按时间」使用效果最好（能看出速率随时间的变化）")
-        g2.addWidget(self.chk_persec_csv, 8, 2, 1, 2)
-        # 行8：查询时间窗（--date-scope，仅 query 类接口有意义）
-        # 按日查 Redis、按月/按年查库：压 Redis 时只发当日用例
         self.lbl_date_scope = QLabel("查询时间窗:")
-        g2.addWidget(self.lbl_date_scope, 9, 0)
+        g2.addWidget(self.lbl_date_scope, r, 0)
         self.combo_date_scope = QComboBox()
         self.combo_date_scope.addItem("不限", "")
         self.combo_date_scope.addItem("当日(查Redis)", "today")
@@ -915,32 +1020,69 @@ class MainWindow(QWidget):
             "· 当月 / 当年 = 查数据库的用例\n"
             "压测 Redis 时选「当日」，避免按月/按年的请求打到数据库。\n"
             "留「不限」= 全部用例（含按月/按年）")
-        g2.addWidget(self.combo_date_scope, 9, 1)
+        g2.addWidget(self.combo_date_scope, r, 1)
 
-        # 行8 右半：账号筛选（--accounts）
-        g2.addWidget(QLabel("指定账号:"), 9, 2)
+        g2.addWidget(QLabel("指定账号:"), r, 2)
         self.edit_accounts = QLineEdit(self.cfg.get("accounts", ""))
         self.edit_accounts.setPlaceholderText("如 010100011301,010100011304（空=全部）")
         self.edit_accounts.setToolTip(
             "只发指定账号的用例（精确匹配 Excel「云单账号」列，逗号分隔）。\n"
             "与「查询时间窗」可叠加：如只发某几个账号的当日查询。\n"
             "未匹配到的账号会在日志里 WARN 提示")
-        g2.addWidget(self.edit_accounts, 9, 3)
+        g2.addWidget(self.edit_accounts, r, 3)
         self._sync_date_scope_control()   # 时间窗随勾选的接口联动
+        r += 1
 
-        # 行9：多进程并行（--procs，每进程独立插件连接；突破单连接吞吐）
-        g2.addWidget(QLabel("并行进程数:"), 10, 0)
-        self.spin_procs = QSpinBox()
-        self.spin_procs.setRange(1, 32)
-        self.spin_procs.setValue(int(self.cfg.get("procs", "1")))
-        self.spin_procs.setToolTip(
-            "把用例自动按行号均分到 N 个进程，各进程独立 CreateMQ/插件连接并行发送，"
-            "用于突破单插件连接吞吐瓶颈（如 10000 条/秒目标）；需远程 Linux + .so。\n"
-            "并行时\"最多条数\"按全部进程合计均分，不会发成 N×max")
-        g2.addWidget(self.spin_procs, 10, 1, 1, 3)
+        # ==================== D. 运行方式 ====================
+        g2.addWidget(_section("运行方式"), r, 0, 1, 4)
+        r += 1
 
-        # 行9：稳定性测试(Soak) 开关 —— 长时间连续跑 + 趋势聚合（由“运行稳定性测试”按钮触发）
-        self.chk_soak = QCheckBox("稳定性测试(Soak，长时间连续跑/趋势汇总)")
+        self.chk_mock = QCheckBox("模拟数据中台应答器 (mock)")
+        self.chk_mock.setChecked(self.cfg.get("mock", "1") == "1")
+        self.chk_mock.setToolTip(
+            "本地/远程启动一个模拟中台应答器，收到插件上线与请求后自动回包。\n"
+            "真实中台已就绪时应关闭，避免与真中台抢答。")
+        g2.addWidget(self.chk_mock, r, 0, 1, 2)
+
+        self.chk_destroy_plugin = QCheckBox("破坏数据走插件 (默认直写 Redis)")
+        self.chk_destroy_plugin.setChecked(self.cfg.get("destroy_via_plugin", "0") == "1")
+        self.chk_destroy_plugin.setToolTip(
+            "勾选：destroy 用例也走插件 SendMQ（测插件侧容错）。\n"
+            "不勾选：destroy 直写 Redis 请求流（更贴近真实入流，默认）。")
+        g2.addWidget(self.chk_destroy_plugin, r, 2, 1, 2)
+        r += 1
+
+        self.chk_preview = QCheckBox("预览模式 (只生成报文不发送)")
+        self.chk_preview.setChecked(self.cfg.get("preview", "0") == "1")
+        self.chk_preview.setToolTip(
+            "勾选后构造报文但不发送（等价 --no-send）：\n"
+            "· 远程执行时也在远程生成 jsonl 并自动下载到本地 out/requests/\n"
+            "· 用于核对动态单号(__REFn__)展开、字段内容是否正确\n"
+            "· 本地 Windows 没有 .so，不勾选也只会预览")
+        g2.addWidget(self.chk_preview, r, 0, 1, 2)
+
+        self.chk_persec_csv = QCheckBox("导出按秒明细CSV")
+        self.chk_persec_csv.setChecked(self.cfg.get("persec_csv", "0") == "1")
+        self.chk_persec_csv.setToolTip(
+            "额外导出 <接口>_<时间>_persec.csv：每秒的请求数/字节/失败/CPU/流增量/平均延迟。\n"
+            "可直接画速率曲线，定位「第几秒开始掉速」。\n"
+            "配合「结束条件=按时间」使用效果最好（能看出速率随时间的变化）")
+        g2.addWidget(self.chk_persec_csv, r, 2, 1, 2)
+        r += 1
+
+        self.chk_quiet = QCheckBox("安静模式 (批量压测建议勾选，减少日志)")
+        self.chk_quiet.setChecked(self.cfg.get("quiet", "1") == "1")
+        self.chk_quiet.setToolTip(
+            "不逐条打印报文/回复，只输出关键信息。\n"
+            "压测时务必勾选：否则每次运行日志可达数 MB（实测 acc_sign 1 万条 -> 2.5MB）。")
+        g2.addWidget(self.chk_quiet, r, 0, 1, 4)
+        r += 1
+
+        # ==================== E. 稳定性测试(Soak) ====================
+        g2.addWidget(_section("稳定性测试(Soak)"), r, 0, 1, 4)
+        r += 1
+
+        self.chk_soak = QCheckBox("启用稳定性测试（长时间连续跑 + 趋势汇总）")
         self.chk_soak.setChecked(self.cfg.get("soak", "0") == "1")
         self.chk_soak.setToolTip(
             "勾选后展开下方 Soak 参数（结束条件/每轮条数/流处理），再点「运行稳定性测试」：\n"
@@ -948,17 +1090,19 @@ class MainWindow(QWidget):
             "· 结束条件可选：按时长（默认 8 小时）或按轮数（短测用，跑够 N 轮自动收尾）\n"
             "· 只输出 trend.csv / summary.json / soak.log（避免海量日志/表格）\n"
             "· 需远程 Linux + .so；本地 Windows 无法真实发送")
-        g2.addWidget(self.chk_soak, 11, 0, 1, 4)
+        g2.addWidget(self.chk_soak, r, 0, 1, 4)
+        r += 1
 
-        # 行11：Soak 参数区 —— 独立容器，随「稳定性测试」勾选显示/隐藏（方案B）
+        # Soak 参数区 —— 独立容器，随「稳定性测试」勾选显示/隐藏（方案B）
         self.soak_params = QWidget()
         gs = QGridLayout(self.soak_params)
-        gs.setContentsMargins(0, 0, 0, 0)
+        gs.setContentsMargins(12, 0, 0, 0)
         gs.setColumnStretch(1, 1)
         gs.setColumnStretch(3, 1)
+        gs.setVerticalSpacing(6)
 
-        # 行9：结束条件（按时长 / 按轮数，二选一）
-        gs.addWidget(QLabel("Soak结束条件:"), 9, 0)
+        rs = 0
+        gs.addWidget(QLabel("Soak结束条件:"), rs, 0)
         self.combo_soak_mode = QComboBox()
         self.combo_soak_mode.addItem("按时长", "hours")
         self.combo_soak_mode.addItem("按轮数", "rounds")
@@ -967,36 +1111,63 @@ class MainWindow(QWidget):
         self.combo_soak_mode.setToolTip(
             "按轮数：跑够 N 轮即正常收尾（便于短测，最快几十秒就能验证整套流程）\n"
             "按时长：连续跑到设定小时数")
-        gs.addWidget(self.combo_soak_mode, 9, 1)
-        gs.addWidget(QLabel("Soak每轮条数:"), 9, 2)
+        gs.addWidget(self.combo_soak_mode, rs, 1)
+
+        gs.addWidget(QLabel("Soak每轮条数:"), rs, 2)
         self.spin_soak_batch = QSpinBox()
         self.spin_soak_batch.setRange(1, 1000000)
         self.spin_soak_batch.setValue(int(self.cfg.get("soak_batch", "1000")))
-        gs.addWidget(self.spin_soak_batch, 9, 3)
+        self.spin_soak_batch.setToolTip(
+            "每一轮发多少条（soak 会用它覆盖 --max）。\n"
+            "\n"
+            "⚠ 这【不是】限速参数：真实速率 = 每轮条数 ÷ 每轮耗时，\n"
+            "而每轮耗时可拆为：发送 + 等待回复 + 固定开销(约 0.8s，"
+            "起子进程/读Excel/CreateMQ/写汇总)。\n"
+            "固定开销每轮都付，故条数越小，被它拉低的平均速率越明显：\n"
+            "  条数 100  -> 实际约 57 条/s\n"
+            "  条数 1000 -> 实际约 93 条/s（固定开销占比降到 ~7%）\n"
+            "想做恒定速率，请用上面的「限速」参数，并把每轮条数调到 ≥1000。")
+        gs.addWidget(self.spin_soak_batch, rs, 3)
+        rs += 1
 
-        # 行10：时长 / 轮数 两个输入框并排，按模式启用其中一个
-        gs.addWidget(QLabel("Soak时长(小时):"), 10, 0)
+        gs.addWidget(QLabel("Soak时长(小时):"), rs, 0)
         self.spin_soak_hours = QDoubleSpinBox()
         self.spin_soak_hours.setRange(0.01, 240)
         self.spin_soak_hours.setValue(float(self.cfg.get("soak_hours", "8")))
-        gs.addWidget(self.spin_soak_hours, 10, 1)
-        gs.addWidget(QLabel("Soak轮数:"), 10, 2)
+        gs.addWidget(self.spin_soak_hours, rs, 1)
+
+        gs.addWidget(QLabel("Soak轮数:"), rs, 2)
         self.spin_soak_rounds = QSpinBox()
         self.spin_soak_rounds.setRange(1, 100000)
         self.spin_soak_rounds.setValue(int(self.cfg.get("soak_rounds", "5")))
         self.spin_soak_rounds.setToolTip("跑够这么多轮就正常结束（--rounds，优先于时长）")
-        gs.addWidget(self.spin_soak_rounds, 10, 3)
+        gs.addWidget(self.spin_soak_rounds, rs, 3)
         self.combo_soak_mode.currentIndexChanged.connect(self._sync_soak_mode)
+        rs += 1
 
-        # 行11：流处理 / 轮换用例 / 轮间隔
-        gs.addWidget(QLabel("Soak流处理:"), 11, 0)
+        gs.addWidget(QLabel("Soak流处理:"), rs, 0)
         self.combo_soak_clean = QComboBox()
         self.combo_soak_clean.addItem("monitor 只监控不清理", "monitor")
         self.combo_soak_clean.addItem("per-round 每轮清理回复流", "per-round")
         _sc = self.combo_soak_clean.findData(self.cfg.get("soak_clean", "monitor"))
         self.combo_soak_clean.setCurrentIndex(_sc if _sc >= 0 else 0)
-        gs.addWidget(self.combo_soak_clean, 11, 1)
-        self.chk_soak_rotate = QCheckBox("轮换用例")
+        gs.addWidget(self.combo_soak_clean, rs, 1)
+
+        # 轮间隔配自己的标签（原布局此处只有孤立的输入框、无标签，容易误解）
+        gs.addWidget(QLabel("Soak轮间隔(秒):"), rs, 2)
+        self.spin_soak_gap = QDoubleSpinBox()
+        self.spin_soak_gap.setRange(0, 3600)
+        self.spin_soak_gap.setValue(float(self.cfg.get("soak_gap", "0")))
+        self.spin_soak_gap.setToolTip(
+            "每轮之间的停顿秒数（默认 0）。\n"
+            "停顿计入每轮耗时，会拉低平均速率：\n"
+            "如 batch=100、每轮本身 1.7s，再加 gap=1 变 2.7s，"
+            "平均速率从 58 条/s 掉到 37 条/s。\n"
+            "想跑满速率请保持 0。")
+        gs.addWidget(self.spin_soak_gap, rs, 3)
+        rs += 1
+
+        self.chk_soak_rotate = QCheckBox("轮换用例（每轮按行号换一批，避免重复发同一批数据）")
         self.chk_soak_rotate.setChecked(self.cfg.get("soak_rotate", "1") == "1")
         self.chk_soak_rotate.setToolTip(
             "每轮按行号轮换用例（末尾回绕），避免重复发同一批数据。\n"
@@ -1012,14 +1183,9 @@ class MainWindow(QWidget):
             "注意：轮换区间绕到表尾时，若该段用例与「用例类型」筛选不匹配"
             "（如尾部全是 error/destroy 而只勾了 normal），该轮会被记为"
             "『跳过』而非异常，不计入 rounds_abnormal。")
-        gs.addWidget(self.chk_soak_rotate, 11, 2)
-        self.spin_soak_gap = QDoubleSpinBox()
-        self.spin_soak_gap.setRange(0, 3600)
-        self.spin_soak_gap.setValue(float(self.cfg.get("soak_gap", "0")))
-        self.spin_soak_gap.setToolTip("每轮之间的停顿秒数")
-        gs.addWidget(self.spin_soak_gap, 11, 3)
+        gs.addWidget(self.chk_soak_rotate, rs, 0, 1, 4)
+        rs += 1
 
-        # 行12：后台运行（nohup/setsid）—— 启动后立即返回，断开 SSH 也不停
         self.chk_soak_nohup = QCheckBox("后台运行(nohup)：启动后立即返回，断开/关闭 GUI 也不停")
         self.chk_soak_nohup.setChecked(self.cfg.get("soak_nohup", "0") == "1")
         self.chk_soak_nohup.setToolTip(
@@ -1028,11 +1194,16 @@ class MainWindow(QWidget):
             "· 启动后日志写入远程 out/soak/soak_<接口>_<时间>_nohup.log（终端输出）\n"
             "  以及 soak_<接口>_<时间>_soak.log（编排日志，用 tail -f 看进度）\n"
             "· 结果不会自动下载：跑完后点「下载结果」或手动 scp\n"
-            "· 停止：在远程执行 pkill -INT -f soak_test.py（别用 -9，会丢 summary.json）")
-        gs.addWidget(self.chk_soak_nohup, 12, 0, 1, 4)
+            "· 停止：在远程执行 pkill -INT -f soak_test.py（别用 -9，会丢 summary.json）\n"
+            "\n"
+            "注意：后台模式启动后 GUI 立即变空闲，重复点击会起多个 soak 实例\n"
+            "（同一个 Redis 流上并发写入）。停止前先 ps 确认，避免漏杀。")
+        gs.addWidget(self.chk_soak_nohup, rs, 0, 1, 4)
         self.chk_soak_nohup.toggled.connect(self._sync_soak_nohup)
+        rs += 1
 
-        g2.addWidget(self.soak_params, 12, 0, 1, 4)
+        g2.addWidget(self.soak_params, r, 0, 1, 4)
+        r += 1
         # 勾选切换时展开/收起参数区；并同步时长/轮数的启用状态
         self.chk_soak.toggled.connect(self._sync_soak_visibility)
         self._sync_soak_visibility()
@@ -1112,6 +1283,14 @@ class MainWindow(QWidget):
         right_lay.addStretch(1)
         right_w.setWidget(inner)
 
+        # 左栏包一层 QScrollArea（理由见左栏创建处的注释）：
+        # 让左栏内容超出可视高度时内部滚动，而不是把整个窗口顶高、挤扁下方标签页
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setWidget(left_inner)
+        left_outer.addWidget(left_scroll, 1)
+
         self.hsplit.addWidget(left_w)
         self.hsplit.addWidget(right_w)
         self.hsplit.setStretchFactor(0, 3)
@@ -1142,8 +1321,8 @@ class MainWindow(QWidget):
         self.btn_upload_all.clicked.connect(self.on_upload_all)
         btns.addWidget(self.btn_upload_all)
         btns.addStretch(1)
-        left_lay.addLayout(btns)
-        left_lay.addStretch(1)
+        # 操作按钮钉在滚动区外面：内容再长也始终可见，小屏不必滚动就能点「运行发送测试」
+        left_outer.addLayout(btns)
 
         # ========== 下半：日志 / 汇总（全宽，汇总表 19 列不再需要横向滚动）==========
         self.tabs = QTabWidget()
@@ -1225,6 +1404,11 @@ class MainWindow(QWidget):
         self.vsplit.addWidget(self.tabs)
         self.vsplit.setStretchFactor(0, 0)
         self.vsplit.setStretchFactor(1, 1)
+        # 下半（运行日志/批量汇总分析）必须给足最小高度：
+        # 旧布局因左栏撑高，vsplit 被保存成畸形比例（如 881,139），
+        # 窗口缩小后 tabs 只剩 139px、表格几乎看不见。
+        # 设了最小高度后，即便 config.ini 里存着这种旧值，也能被顶回来。
+        self.tabs.setMinimumHeight(260)
         root.addWidget(self.vsplit, 1)
 
         # ---- 顶栏连接摘要随配置实时刷新 ----
@@ -1237,8 +1421,38 @@ class MainWindow(QWidget):
 
         self._restore_splitter("hsplit", self.hsplit, [880, 500])
         self._restore_splitter("vsplit", self.vsplit, [480, 362])
+
+        # 统一给面板里所有数字框/下拉框装"滚轮防误改"（见 WheelGuard 说明）。
+        # 放在构建末尾一次性安装：比在每个控件创建处逐个 install 更不容易漏，
+        # 后续新增控件也只需在这里自动覆盖（本窗口内所有 Spin/Combo 都在此列）。
+        WHEEL_GUARD.install(*self.findChildren(QSpinBox),
+                            *self.findChildren(QDoubleSpinBox),
+                            *self.findChildren(QComboBox))
+
         self.update_excel_label()
         self._update_conn_summary()
+
+    def _initial_window_size(self):
+        """按屏幕可用区域算一个合适的初始窗口尺寸（不超出屏幕）。
+
+        目标：默认宽 1380、高 900；若屏幕装不下（含任务栏/边框），
+        则按可用区域收缩并留出边距，避免窗口一打开就溢出屏幕
+        （下方「运行日志/批量汇总分析」标签页被推到屏幕外）。
+        同时给出一个下限，太小的窗口可用性差。
+        """
+        want_w, want_h = 1380, 900
+        min_w, min_h = 1000, 620
+        try:
+            scr = self.screen() or QApplication.primaryScreen()
+            if scr is None:
+                return want_w, want_h
+            av = scr.availableGeometry()      # 已扣除任务栏
+            # 留 40px 边距，避免贴着屏幕边缘/被任务栏盖住
+            w = min(want_w, max(min_w, av.width() - 40))
+            h = min(want_h, max(min_h, av.height() - 40))
+            return w, h
+        except Exception:
+            return want_w, want_h
 
     # ---------- 布局辅助 ----------
     def _update_conn_summary(self):
@@ -1253,13 +1467,24 @@ class MainWindow(QWidget):
         self.lbl_conn.setText(f"Redis {r}    |    执行 {exe}")
 
     def _restore_splitter(self, key, splitter, default):
-        """恢复上次的分割比例；配置无效则用默认值"""
+        """恢复上次的分割比例；配置无效则用默认值。
+
+        除"个数/正数"校验外，还要求两段都不能太离谱：
+        旧布局（左栏未加滚动区）会把窗口顶高、把下方 tabs 挤到 ~139px，
+        于是 config.ini 里存下 vsplit=881,139 这种畸形比例
+        （139/1020 = 13.6%）。若不加判断地恢复，换到小屏后表格就只剩一条缝。
+        故任一段占比 < 20% 时视为失效，回退默认值。
+        正常用户拖拽出的比例两段都在 20% 以上，不会被误伤。
+        """
         raw = self.cfg.get(key, "")
         try:
             sizes = [int(x) for x in raw.split(",") if x.strip()]
             if len(sizes) == len(default) and all(s > 0 for s in sizes):
-                splitter.setSizes(sizes)
-                return
+                total = sum(sizes)
+                # 占比过小（<20%）说明是畸形旧值，不恢复
+                if total > 0 and min(sizes) / total >= 0.20:
+                    splitter.setSizes(sizes)
+                    return
         except Exception:
             pass
         splitter.setSizes(list(default))
@@ -1760,43 +1985,8 @@ class MainWindow(QWidget):
                 _base + "\n【当前「用例类型」未勾选 destroy → 此项不生效】\n"
                         "该参数仅作用于 destroy 用例；若要测破坏场景，请勾选 destroy")
 
-    def _end_by_time(self):
-        """当前是否「按时间」结束"""
-        return (self.combo_end_mode.currentData() or "count") == "time"
-
-    def _sync_end_mode(self):
-        """按「结束条件」启用/置灰 条数与秒数输入框。
-
-        与 Soak 的联动统一收口到 _sync_max_enabled()，避免两处 setEnabled 互相覆盖。
-        """
-        by_time = self._end_by_time()
-        if hasattr(self, "spin_seconds"):
-            self.spin_seconds.setEnabled(by_time)
-            if hasattr(self, "lbl_seconds"):
-                self.lbl_seconds.setEnabled(by_time)
-        self._sync_max_enabled()
-
-    def _sync_max_enabled(self):
-        """「最多条数」可用性 = 结束条件为按条数 且 未勾选 Soak。
-
-        两处联动（结束条件 / Soak 勾选）都走这里，保证状态一致。
-        """
-        if not hasattr(self, "spin_max"):
-            return
-        soak_on = hasattr(self, "chk_soak") and self.chk_soak.isChecked()
-        by_time = self._end_by_time()
-        ok = (not by_time) and (not soak_on)
-        self.spin_max.setEnabled(ok)
-        if hasattr(self, "lbl_max"):
-            self.lbl_max.setEnabled(ok)
-        self.spin_max.setToolTip(
-            "总条数上限（0=全部）。注意：并行进程数>1 时，此值为全部进程合计条数，"
-            "会按进程均分；不会每个进程都发满 N 次"
-            + ("\n【结束条件=按时间 → 此项不生效】\n"
-               "改由「运行秒数」决定发送时长" if by_time else "")
-            + ("\n【当前已勾选「稳定性测试(Soak)」→ 此项不生效】\n"
-               "每轮条数改由下方「Soak每轮条数」决定（soak 会用它覆盖 --max）"
-               if soak_on else ""))
+    # 注意：_end_by_time / _sync_end_mode / _sync_max_enabled 定义在本类后方
+    # （原文件此处曾有一份完全相同的副本，被后方定义覆盖而成为死代码，已删除）
 
     def build_send_cmd(self, name):
         """构造 send_test.py 的命令行"""
