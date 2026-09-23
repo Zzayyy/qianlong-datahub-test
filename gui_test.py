@@ -498,6 +498,11 @@ DEFAULT_CONFIG = {
     "summary_expand": "0",  # 多进程运行汇总按进程展开显示（1=每进程一行，0=仅全局一行）
     "ref_map": "",       # create 返回 Ref 回填文件（_refs.json），set/modify/remove 生成时填真实单号
     "download_dir": "out/performance",
+    # Redis 连接（写入远程 DataHub.ini 的 [REDIS] 段用；右侧「Redis 配置」面板）
+    "r_host": "192.168.1.137",
+    "r_port": "6379",
+    "r_pwd": "QianLong@2026&",
+    "r_db": "0",
     "remote": "1",       # 启用远程执行
     "quiet": "1",        # 安静模式
     "cases": "",         # 用例编号筛选（空=全部）
@@ -512,12 +517,16 @@ DEFAULT_CONFIG = {
     "preview": "0",      # 预览模式（--no-send，只生成报文不发送）
     "no_reply": "0",     # 只发不收（--no-reply：不请求/不累积/不统计回复）
     "rate": "0",         # 限速条/s（--rate，0=不限速）
+    "types": "",         # 用例类型勾选（normal,error,destroy；空=全不勾选=发全部类型）
     "soak": "0",         # 稳定性测试(Soak) 开关
     "soak_hours": "8",   # Soak 总时长（小时）
     "soak_batch": "1000",  # Soak 每轮条数
     "soak_gap": "0",     # Soak 轮间间隔（秒）
     "soak_clean": "monitor",  # Soak 流处理：monitor=只监控 / per-round=每轮清理回复流
     "soak_rotate": "1",  # Soak 轮换用例（避免重复发同一批数据）
+    "soak_mode": "hours",  # Soak 结束条件：hours=按时长 / rounds=按轮数
+    "soak_rounds": "5",  # Soak 轮数（soak_mode=rounds 时生效）
+    "soak_nohup": "0",   # Soak 后台运行（setsid+nohup，启动后立即返回）
     "box_redis": "1",    # 右侧三个标题条的展开状态
     "box_linux": "1",
     "box_out": "1",
@@ -957,7 +966,16 @@ class MainWindow(QWidget):
         self.chk_type_normal = QCheckBox("normal")
         self.chk_type_error = QCheckBox("error")
         self.chk_type_destroy = QCheckBox("destroy")
-        # 默认全不勾选：压测/破坏分开展，避免误发 destroy 直写 Redis
+        # 默认全不勾选：压测/破坏分开展，避免误发 destroy 直写 Redis。
+        # 勾选状态需持久化（types 键，逗号分隔）：否则重启后从"只发 normal"
+        # 悄悄变回"全不勾选"，而"全不勾选 = 发全部类型（含 destroy）"，
+        # 会让下一次压测意外带上 destroy 直写 Redis 的用例。
+        _saved_types = (self.cfg.get("types", "") or "").strip()
+        if _saved_types:
+            _want = {t.strip().lower() for t in _saved_types.split(",") if t.strip()}
+            self.chk_type_normal.setChecked("normal" in _want)
+            self.chk_type_error.setChecked("error" in _want)
+            self.chk_type_destroy.setChecked("destroy" in _want)
         for cb in (self.chk_type_normal, self.chk_type_error, self.chk_type_destroy):
             type_box.addWidget(cb)
             cb.toggled.connect(self._sync_destroy_controls)
@@ -2245,6 +2263,8 @@ class MainWindow(QWidget):
             "mock": "1" if self.chk_mock.isChecked() else "0",
             "quiet": "1" if self.chk_quiet.isChecked() else "0",
             "cases": self.edit_cases.text().strip(),
+            # 用例类型勾选（空=全不勾选=发全部类型）。必须持久化，理由见创建处注释
+            "types": ",".join(self.selected_types()),
             "end_mode": self.combo_end_mode.currentData() or "count",
             "seconds": str(self.spin_seconds.value()),
             "persec_csv": "1" if self.chk_persec_csv.isChecked() else "0",
